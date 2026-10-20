@@ -6,8 +6,11 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/bpf.h>
+#include <linux/bpf_trace.h>
 #include <linux/cpumask.h>
 #include <linux/etherdevice.h>
+#include <linux/filter.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/net.h>
@@ -18,6 +21,7 @@
 #include <linux/smp.h>
 #include <linux/workqueue.h>
 #include <net/page_pool/helpers.h>
+#include <net/xdp.h>
 
 #include "octeon_pip.h"
 #include "octeon_pip_fpa.h"
@@ -43,6 +47,12 @@
 
 /* The refill worker's retry after an allocation failure of an idle poll */
 #define OPIP_REFILL_RETRY	msecs_to_jiffies(20)
+
+/*
+ * On while a port has an XDP program: the polls run their instance with
+ * the program's tests, see opip_poll(). Counted by opip_xdp_setup().
+ */
+DEFINE_STATIC_KEY_FALSE(opip_rx_xdp_key);
 
 static irqreturn_t opip_group_irq(int irq, void *data)
 {
@@ -225,23 +235,107 @@ static void opip_rx_copy_segments(struct opip_wqe *wqe, struct sk_buff *skb)
 }
 
 /*
+ * XDP_TX of a packet in one buffer, as the program left it. BACK has four
+ * bits: data moved 2048 bytes or more into a whole page cannot name its
+ * buffer (a slice ends before that). Always inline: per packet.
+ */
+static __always_inline int opip_rx_xdp_tx_one(struct opip_group *group,
+					      struct net_device *dev,
+					      void *buffer,
+					      const struct xdp_buff *xdp)
+{
+	unsigned int len = xdp->data_end - xdp->data;
+	u64 addr = opip_xkphys_to_phys(xdp->data);
+	unsigned int back;
+
+	back = (addr >> 7) - (opip_xkphys_to_phys(buffer) >> 7);
+	if (back > FIELD_MAX(OPIP_BUF_BACK))
+		return -EINVAL;
+	return opip_xdp_tx(dev, &group->tx_poll,
+			   opip_buf_build(addr, len, OPIP_POOL_PACKET, back,
+					  false), len);
+}
+
+/*
+ * Run the XDP program of the port on a packet in one buffer, as @xdp has
+ * it: the caller prepared it, the whole buffer at @buffer. For XDP_TX the
+ * buffer stays the hardware's, for a drop it goes back to the hardware,
+ * for XDP_REDIRECT it becomes the frame's and the pool is refilled for it;
+ * for XDP_PASS the caller builds the skb from @xdp. Always inline: per
+ * packet.
+ *
+ * Return: the verdict
+ */
+static __always_inline u32 opip_rx_xdp(struct opip_group *group,
+				       struct net_device *dev,
+				       struct bpf_prog *prog,
+				       struct opip_wqe *wqe, void *buffer,
+				       struct xdp_buff *xdp)
+{
+	u32 act;
+
+	act = bpf_prog_run_xdp(prog, xdp);
+	switch (act) {
+	case XDP_PASS:
+		return act;
+	case XDP_TX:
+		if (opip_rx_xdp_tx_one(group, dev, buffer, xdp)) {
+			trace_xdp_exception(dev, prog, act);
+			dev_core_stats_tx_dropped_inc(dev);
+			goto free;
+		}
+		break;
+	case XDP_REDIRECT:
+		if (xdp_do_redirect(dev, xdp, prog)) {
+			trace_xdp_exception(dev, prog, act);
+			goto free;
+		}
+		WRITE_ONCE(group->to_refill, group->to_refill + 1);
+		break;
+	default:
+		bpf_warn_invalid_xdp_action(dev, prog, act);
+		fallthrough;
+	case XDP_ABORTED:
+		trace_xdp_exception(dev, prog, act);
+		fallthrough;
+	case XDP_DROP:
+free:
+		opip_fpa_free(buffer, OPIP_POOL_PACKET,
+			      OPIP_POOL_PACKET_SIZE / 128);
+		act = XDP_DROP;
+		break;
+	}
+	opip_fpa_free_nosync(wqe, OPIP_POOL_WQE, 1);
+	return act;
+}
+
+/*
  * The zero copy path: a packet that fits in one buffer gets an skb built
  * around it. The buffer is a page (or a slice) of any group's page pool
  * (the packet pool mixes them) and goes back to that pool with its last
  * skb: into its cache when freed in its own group's poll, else its ring.
- * Always inline: with two callers gcc calls it out of line, per packet.
+ * The skb comes from the packet's xdp_buff, as an XDP program left it:
+ * the head and the metadata where it moved them, the buffer the same.
+ * Not xdp_build_skb_from_buff(): a call per packet, the receive queue and
+ * the protocol are opip_rx_deliver()'s, and the frame size and the page
+ * pool are constants here. Always inline: with two callers gcc calls it
+ * out of line, per packet.
  */
-static __always_inline struct sk_buff *opip_rx_build_skb(void *buffer,
-							 void *data,
-							 unsigned int len)
+static __always_inline struct sk_buff *
+opip_rx_build_xdp_skb(const struct xdp_buff *xdp)
 {
-	struct sk_buff *skb = napi_build_skb(buffer, OPIP_RX_FRAG_SIZE);
+	struct sk_buff *skb;
+	int meta;
 
+	skb = napi_build_skb(xdp->data_hard_start, OPIP_RX_FRAG_SIZE);
 	if (unlikely(!skb))
 		return NULL;
 	skb_mark_for_recycle(skb);
-	skb_reserve(skb, data - buffer);
-	__skb_put(skb, len);
+	skb_reserve(skb, xdp->data - xdp->data_hard_start);
+	__skb_put(skb, xdp->data_end - xdp->data);
+	meta = xdp->data - xdp->data_meta;
+	if (meta > 0)
+		skb_metadata_set(skb, meta);
 	return skb;
 }
 
@@ -272,7 +366,8 @@ static struct sk_buff *opip_rx_copy_skb(struct opip_group *group,
 static __always_inline void opip_rx_deliver(struct opip_group *group,
 					    struct net_device *dev,
 					    struct opip_wqe *wqe,
-					    struct sk_buff *skb)
+					    struct sk_buff *skb,
+					    bool csum_valid)
 {
 	/* Read once per packet, for both tests */
 	netdev_features_t features = dev->features;
@@ -299,7 +394,7 @@ static __always_inline void opip_rx_deliver(struct opip_group *group,
 	/* The PIP checks no L4 checksum of a fragment */
 	if (unlikely((wqe->word2 & (OPIP_WQE2_NOT_IP | OPIP_WQE2_IP_EXC |
 				    OPIP_WQE2_IS_FRAG | OPIP_WQE2_L4_ERROR)) ||
-		     !(wqe->word2 & OPIP_WQE2_TCP_OR_UDP) ||
+		     !(wqe->word2 & OPIP_WQE2_TCP_OR_UDP) || !csum_valid ||
 		     !(features & NETIF_F_RXCSUM)))
 		skb->ip_summed = CHECKSUM_NONE;
 	else
@@ -307,17 +402,30 @@ static __always_inline void opip_rx_deliver(struct opip_group *group,
 	napi_gro_receive(&group->napi, skb);
 }
 
-/* A packet not in one buffer, or in the entry alone: it is copied */
-static noinline void opip_rx_slow_packet(struct opip_group *group,
+/*
+ * A packet not in one buffer, or in the entry alone: it is copied. An XDP
+ * program sees the packets in one buffer only, the others do not pass
+ * it. Returns false: nothing is redirected.
+ */
+static noinline bool opip_rx_slow_packet(struct opip_group *group,
 					 struct opip_wqe *wqe,
 					 struct net_device *dev)
 {
+	struct bpf_prog *prog = rcu_dereference_bh(opip_port(dev)->xdp_prog);
 	struct sk_buff *skb;
+
+	/* A packet the program cannot see does not pass it */
+	if (unlikely(prog)) {
+		dev_core_stats_rx_dropped_inc(dev);
+		opip_rx_free_work(wqe);
+		return false;
+	}
 
 	skb = opip_rx_copy_skb(group, wqe);
 	if (skb)
-		opip_rx_deliver(group, dev, wqe, skb);
+		opip_rx_deliver(group, dev, wqe, skb, true);
 	opip_rx_free_work(wqe);
+	return false;
 }
 
 /* A packet for a port without a device, or for a device that is not open */
@@ -332,11 +440,20 @@ static noinline __cold void opip_rx_drop_closed(struct opip_wqe *wqe,
 	opip_rx_free_work(wqe);
 }
 
-/* One received packet: receive errors, the skb and its delivery */
-static void opip_rx_packet(struct opip_group *group, struct opip_wqe *wqe,
-			   struct net_device *dev, int port)
+/*
+ * One received packet: receive errors, the XDP program, the skb and its
+ * delivery. Returns true if the program redirected the packet. Without
+ * @xdp no port has a program (in a packet in one buffer; the chains look
+ * for themselves). Always inline: the two instances of the poll need
+ * their own, one without the program's code.
+ */
+static __always_inline bool opip_rx_packet(struct opip_group *group,
+					   struct opip_wqe *wqe,
+					   struct net_device *dev, int port,
+					   const bool xdp_on)
 {
 	bool skb_in_hw = opip_wqe_bufs(wqe) == 1;
+	bool csum_valid = true;
 	void *buffer = NULL;
 	struct sk_buff *skb;
 	unsigned int len;
@@ -347,37 +464,61 @@ static void opip_rx_packet(struct opip_group *group, struct opip_wqe *wqe,
 
 	if (unlikely(wqe->word2 & OPIP_WQE2_RCV_ERROR) &&
 	    opip_rx_check_error(wqe, dev, port))
-		return;
+		return false;
 
 	/*
-	 * A device being closed (stopped already, IFF_UP not cleared yet)
-	 * delivers nothing
+	 * One test for the skbs and XDP: a device being closed (stopped
+	 * already, IFF_UP not cleared yet) neither delivers nor sends
 	 */
 	if (unlikely(!dev || !netif_running(dev))) {
 		opip_rx_drop_closed(wqe, dev, port);
-		return;
+		return false;
 	}
 
 	data = opip_virt(opip_buf_addr(wqe->packet_ptr));
 	len = opip_wqe_len(wqe);
 
+	/*
+	 * An XDP program sees the packets that sit in one buffer. With a
+	 * program or without, the packet is an xdp_buff of the whole
+	 * buffer and the skb is built from it.
+	 */
 	if (likely(skb_in_hw)) {
-		skb = opip_rx_build_skb(buffer, data, len);
+		struct bpf_prog *prog = NULL;
+		struct xdp_buff xdp;
+
+		if (xdp_on)
+			prog = rcu_dereference_bh(opip_port(dev)->xdp_prog);
+
+		xdp_init_buff(&xdp, OPIP_RX_FRAG_SIZE, NULL);
+		xdp_prepare_buff(&xdp, buffer, data - buffer, len, true);
+		if (prog) {
+			u32 act;
+
+			/* The port's queue of the group */
+			xdp.rxq = &opip_port(dev)->xdp_rxq[group->group];
+			act = opip_rx_xdp(group, dev, prog, wqe, buffer, &xdp);
+			if (act != XDP_PASS)
+				return act == XDP_REDIRECT;
+			csum_valid = xdp.data == data &&
+				     xdp.data_end == data + len;
+		}
+		skb = opip_rx_build_xdp_skb(&xdp);
 	} else {
-		opip_rx_slow_packet(group, wqe, dev);
-		return;
+		return opip_rx_slow_packet(group, wqe, dev);
 	}
 
 	if (unlikely(!skb)) {
 		opip_rx_free_work(wqe);
-		return;
+		return false;
 	}
 
-	opip_rx_deliver(group, dev, wqe, skb);
+	opip_rx_deliver(group, dev, wqe, skb, csum_valid);
 
 	/* The entry goes back; the skb's buffer is replaced later */
 	WRITE_ONCE(group->to_refill, group->to_refill + 1);
 	opip_fpa_free_nosync(wqe, OPIP_POOL_WQE, 1);
+	return false;
 }
 
 /*
@@ -450,7 +591,8 @@ static unsigned int opip_rx_refill(struct opip_group *group)
 	return n;
 }
 
-static int opip_poll(struct opip_group *group, int budget)
+static __always_inline int __opip_poll(struct opip_group *group, int budget,
+				       const bool xdp_on)
 {
 	/*
 	 * Per poll: the chips with port kinds deliver those in place of the
@@ -464,7 +606,7 @@ static int opip_poll(struct opip_group *group, int budget)
 	u64 old_mask, old_scratch = 0;
 	int bp_port = 0, bp_bufs = 0;
 	int rx_count = 0;
-	bool requested = false, idle = false;
+	bool requested = false, idle = false, redirected = false;
 
 	prefetch(ports);
 
@@ -476,6 +618,16 @@ static int opip_poll(struct opip_group *group, int budget)
 
 	old_mask = opip_pow_select_group(core, group->group);
 	opip_tx_poll_begin(&group->tx_poll, budget);
+	/*
+	 * The packet pool mixes the pages of all groups' page pools: what XDP
+	 * returns in this poll (a frame a devmap flush could not send, a
+	 * packet AF_XDP copied) may be another group's page, and only that
+	 * group's poll may use its pool's cache. Without the direct returns
+	 * the page pool still puts a page of its own into the cache, by the
+	 * CPU of its NAPI, and the others into their pools' rings.
+	 */
+	xdp_set_return_frame_no_direct();
+
 	/*
 	 * The loop runs two work entries ahead of the stack: the one in
 	 * hand had its cache line fetched while the stack handled the one
@@ -539,7 +691,7 @@ static int opip_poll(struct opip_group *group, int budget)
 			bp_bufs += opip_wqe_bufs(wqe);
 		}
 
-		opip_rx_packet(group, wqe, dev, port);
+		redirected |= opip_rx_packet(group, wqe, dev, port, xdp_on);
 
 		/*
 		 * Complete what the PKO has sent on the poll's queues now and
@@ -556,6 +708,9 @@ static int opip_poll(struct opip_group *group, int budget)
 	}
 	if (idle)
 		opip_pow_group_ack(group->group);
+	if (redirected)
+		xdp_do_flush();
+	xdp_clear_return_frame_no_direct();
 	if (bp_count)
 		opip_ipd_bp_sub(bp_port, bp_bufs);
 	opip_tx_poll_end(&group->tx_poll, idle);
@@ -576,6 +731,30 @@ static int opip_poll(struct opip_group *group, int budget)
 	if (!idle)
 		return budget;
 	return rx_count;
+}
+
+/*
+ * The poll in two instances: with the tests for an XDP program, and
+ * without, while no port has one. The packet's xdp_buff never leaves
+ * the second, so it lives in registers there, and its skb path is the
+ * one of a driver without XDP. opip_xdp_setup() turns the key on before
+ * a first program is visible to a poll and off after the last is gone.
+ */
+static noinline int opip_poll_xdp(struct opip_group *group, int budget)
+{
+	return __opip_poll(group, budget, true);
+}
+
+static noinline int opip_poll_skb(struct opip_group *group, int budget)
+{
+	return __opip_poll(group, budget, false);
+}
+
+static int opip_poll(struct opip_group *group, int budget)
+{
+	if (static_branch_unlikely(&opip_rx_xdp_key))
+		return opip_poll_xdp(group, budget);
+	return opip_poll_skb(group, budget);
 }
 
 static int opip_napi_poll(struct napi_struct *napi, int budget)

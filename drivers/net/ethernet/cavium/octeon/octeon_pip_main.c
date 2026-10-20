@@ -13,6 +13,7 @@
  * Copyright (c) 2003-2018 Cavium, Inc. / Cavium Networks.
  */
 
+#include <linux/bpf.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
@@ -29,6 +30,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <net/netdev_queues.h>
+#include <net/xdp.h>
 
 #include "octeon_pip.h"
 #include "octeon_pip_fpa.h"
@@ -602,10 +604,98 @@ static void opip_set_hw_mtu(struct net_device *dev, int new_mtu)
 	}
 }
 
+/* The largest MTU for an XDP program: a packet in one buffer */
+static unsigned int opip_xdp_max_mtu(const struct bpf_prog *prog)
+{
+	return OPIP_XDP_MAX_MTU;
+}
+
 static int opip_change_mtu(struct net_device *dev, int new_mtu)
 {
+	struct bpf_prog *prog = rtnl_dereference(opip_port(dev)->xdp_prog);
+
+	if (prog && new_mtu > opip_xdp_max_mtu(prog)) {
+		netdev_warn(dev, "MTU %d is too large for the XDP program, %u at most\n",
+			    new_mtu, opip_xdp_max_mtu(prog));
+		return -EINVAL;
+	}
 	WRITE_ONCE(dev->mtu, new_mtu);
 	opip_set_hw_mtu(dev, new_mtu);
+	return 0;
+}
+
+/* Attach or detach the XDP program of a port, under rtnl */
+static int opip_xdp_setup(struct net_device *dev, struct netdev_bpf *bpf)
+{
+	struct opip_port *p = opip_port(dev);
+	struct bpf_prog *old;
+
+	if (bpf->command != XDP_SETUP_PROG)
+		return -EINVAL;
+	if (bpf->prog && dev->mtu > opip_xdp_max_mtu(bpf->prog)) {
+		unsigned int max = opip_xdp_max_mtu(bpf->prog);
+
+		NL_SET_ERR_MSG_FMT_MOD(bpf->extack,
+				       "MTU %u too large for XDP without multi-buffer support, %u at most",
+				       dev->mtu, max);
+		return -EOPNOTSUPP;
+	}
+	old = rtnl_dereference(p->xdp_prog);
+	/*
+	 * The polls run their XDP instance (opip_poll()) from before a first
+	 * program is visible to them until after it is gone: the key goes on
+	 * and the polls running without it end before the program is set.
+	 */
+	if (bpf->prog && !old) {
+		static_branch_inc(&opip_rx_xdp_key);
+		synchronize_net();
+	}
+	rcu_assign_pointer(p->xdp_prog, bpf->prog);
+	/* bpf_prog_put() frees after a grace period, past the polls (BH off) */
+	if (old)
+		bpf_prog_put(old);
+	/*
+	 * The key may go off at once: a poll still in the XDP instance runs
+	 * the old program or none, and bpf_prog_put() waits for it
+	 */
+	if (old && !bpf->prog)
+		static_branch_dec(&opip_rx_xdp_key);
+	return 0;
+}
+
+/* The receive groups are the XDP receive queues of every port */
+static void opip_xdp_rxq_unregister(struct net_device *dev)
+{
+	struct opip_port *p = opip_port(dev);
+	int i;
+
+	for (i = 0; i < OPIP_MAX_GROUPS; i++)
+		if (xdp_rxq_info_is_reg(&p->xdp_rxq[i]))
+			xdp_rxq_info_unreg(&p->xdp_rxq[i]);
+}
+
+static int opip_xdp_rxq_register(struct net_device *dev)
+{
+	struct opip_port *p = opip_port(dev);
+	struct opip *opip = p->opip;
+	int i, ret;
+
+	for (i = 0; i < OPIP_MAX_GROUPS; i++) {
+		struct opip_group *group = &opip->groups[i];
+
+		if (!(opip->groups_mask & BIT(i)))
+			continue;
+		ret = xdp_rxq_info_reg(&p->xdp_rxq[i], dev, i,
+				       group->napi.napi_id);
+		if (!ret)
+			ret = xdp_rxq_info_reg_mem_model(&p->xdp_rxq[i],
+							 MEM_TYPE_PAGE_POOL,
+							 group->pp);
+		if (ret) {
+			opip_xdp_rxq_unregister(dev);
+			return ret;
+		}
+	}
 	return 0;
 }
 
@@ -675,6 +765,11 @@ static int opip_ndo_init(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
 	unsigned int i;
+	int ret;
+
+	ret = opip_xdp_rxq_register(dev);
+	if (ret)
+		return ret;
 
 	/*
 	 * Receive queue i is group i, whose NAPI is on opip->napi_dev; each
@@ -703,6 +798,11 @@ static int opip_ndo_init(struct net_device *dev)
 
 	opip_port_enable(p, false);
 	return 0;
+}
+
+static void opip_ndo_uninit(struct net_device *dev)
+{
+	opip_xdp_rxq_unregister(dev);
 }
 
 static int opip_ndo_open(struct net_device *dev)
@@ -739,6 +839,13 @@ static int opip_ndo_open(struct net_device *dev)
 static int opip_ndo_stop(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
+
+	/*
+	 * XDP sends (XDP_TX from the shared receive polls, ndo_xdp_xmit
+	 * from other devices) test netif_running() without the qdisc: wait
+	 * for those that saw it set before the queues are drained and reset
+	 */
+	synchronize_net();
 
 	if (!opip_iface_is_gmx(p->iface)) {
 		/* The packets in flight reference the device */
@@ -778,6 +885,7 @@ static int opip_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 
 static const struct net_device_ops opip_netdev_ops = {
 	.ndo_init		= opip_ndo_init,
+	.ndo_uninit		= opip_ndo_uninit,
 	.ndo_open		= opip_ndo_open,
 	.ndo_stop		= opip_ndo_stop,
 	.ndo_start_xmit		= opip_xmit,
@@ -787,6 +895,8 @@ static const struct net_device_ops opip_netdev_ops = {
 	.ndo_set_mac_address	= opip_set_mac_address,
 	.ndo_eth_ioctl		= opip_ioctl,
 	.ndo_change_mtu		= opip_change_mtu,
+	.ndo_bpf		= opip_xdp_setup,
+	.ndo_xdp_xmit		= opip_xdp_xmit,
 	.ndo_get_stats64	= opip_get_stats64,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= opip_tx_netpoll,
@@ -1000,8 +1110,9 @@ static void opip_setup_xps(struct net_device *dev)
  * Release what opip_alloc_port() took. The device's own queue count is
  * gone once it is unregistered: the port's is used. A drain that gave up
  * left packets in the queues, the PKO reset since: free them. Lost are
- * the chunks the PKO still held but the current one; the pool's count
- * warns of them.
+ * the chunks the PKO still held but the current one, and the buffers of
+ * XDP_TX packets: only the PKO frees those, and the one its engine had
+ * taken it may have freed already. The pools' counts warn of them.
  */
 static void opip_put_port(struct net_device *dev)
 {
@@ -1065,7 +1176,7 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 		return NULL;
 	}
 
-	/* A transmit queue per PKO queue, a receive queue per group */
+	/* A receive queue per group: the queue index of its XDP packets */
 	num_queues = clamp(opip_pko_num_queues(opip, port), 1, OPIP_MAX_TXQS);
 	dev = alloc_etherdev_mqs(sizeof(*p), num_queues,
 				 hweight32(opip->groups_mask));
@@ -1107,6 +1218,9 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	dev->features |= dev->hw_features;
 	dev->vlan_features |= dev->hw_features;
 	dev->hw_enc_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
+	xdp_set_features_flag(dev, NETDEV_XDP_ACT_BASIC |
+			      NETDEV_XDP_ACT_REDIRECT |
+			      NETDEV_XDP_ACT_NDO_XMIT);
 
 	/*
 	 * opip_probe() has waited for the nvmem cells: a failure here is final

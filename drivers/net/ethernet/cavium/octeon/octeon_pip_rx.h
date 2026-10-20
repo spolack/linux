@@ -5,9 +5,12 @@
 #ifndef OCTEON_PIP_RX_H
 #define OCTEON_PIP_RX_H
 
+#include <linux/jump_label.h>
 #include <linux/netdevice.h>
 
 #include "octeon_pip.h"
+
+DECLARE_STATIC_KEY_FALSE(opip_rx_xdp_key);
 
 int opip_rx_init(struct opip *opip);
 void opip_rx_shutdown(struct opip *opip);

@@ -3,9 +3,11 @@
  * The transmit side of octeon_pip.
  *
  * Each port has one PKO output queue per CPU, as far as the chip has
- * them, and one netdev TX queue per PKO queue. XPS gives every CPU a
- * queue of its own as far as there are queues; the TX queue lock is all
- * the locking the command chunks of a queue need.
+ * them, and one netdev TX queue per PKO queue. XPS maps every CPU to its
+ * own queue and XDP sends on the CPU's queue, so the TX queue lock is
+ * uncontended unless a port has fewer queues than there are CPUs (then
+ * XDP takes the CPU number modulo the queues); it is all the locking the
+ * command chunks of a queue need.
  *
  * Every command is two words: the command word and one buffer pointer, or
  * the pointer to a gather list. The PKO fetches commands in 64 byte units,
@@ -55,6 +57,7 @@
 #include <linux/netpoll.h>
 #include <linux/preempt.h>
 #include <linux/prefetch.h>
+#include <linux/rcupdate.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <net/ip.h>
@@ -90,15 +93,25 @@
 #define OPIP_TX_TIMER_NS	(250 * NSEC_PER_USEC)
 
 /*
- * A packet in the ring is an skb, or an skb with a gather list (bit 1,
- * the list's address is in skb->cb)
+ * A packet in the ring is an skb, an skb with a gather list (bit 1, the
+ * list's address is in skb->cb), an XDP frame (bit 0), or nothing but
+ * bit 0: a buffer the PKO frees to the packet pool itself, see
+ * opip_xdp_tx().
  */
+#define OPIP_TX_XDP		1UL
 #define OPIP_TX_GATHER		2UL
-#define OPIP_TX_FLAGS		OPIP_TX_GATHER
+#define OPIP_TX_FLAGS		(OPIP_TX_XDP | OPIP_TX_GATHER)
 
 static struct sk_buff *opip_tx_entry_skb(unsigned long entry)
 {
-	return (struct sk_buff *)(entry & ~OPIP_TX_FLAGS);
+	return entry & OPIP_TX_XDP ? NULL :
+	       (struct sk_buff *)(entry & ~OPIP_TX_FLAGS);
+}
+
+static struct xdp_frame *opip_tx_entry_xdpf(unsigned long entry)
+{
+	return entry & OPIP_TX_XDP ?
+	       (struct xdp_frame *)(entry & ~OPIP_TX_FLAGS) : NULL;
 }
 
 /* The gather list of a fragmented skb sits in a buffer from the WQE pool */
@@ -126,11 +139,13 @@ static int opip_txq_free_slots(struct opip_txq *q)
 
 /*
  * The command word for a packet of one buffer on queue @q: the PKO
- * subtracts one from the queue's FAU register once the packet is out,
- * and leaves the buffer alone. Always inline: at -Os gcc calls it out
- * of line, per packet.
+ * subtracts one from the queue's FAU register once the packet is out, and
+ * frees the buffer to its pool only if the packet asks it to (@free): an
+ * XDP_TX packet sits in a buffer of the packet pool. Always inline: at
+ * -Os gcc calls it out of line, per packet.
  */
-static __always_inline u64 opip_pko_cmd(struct opip_txq *q, unsigned int len)
+static __always_inline u64 opip_pko_cmd(struct opip_txq *q, unsigned int len,
+					bool free)
 {
 	u64 cmd = FIELD_PREP(OPIP_PKO_CMD_TOTAL_BYTES, len) |
 		  FIELD_PREP(OPIP_PKO_CMD_SEGS, 1) |
@@ -142,7 +157,9 @@ static __always_inline u64 opip_pko_cmd(struct opip_txq *q, unsigned int len)
 
 	if (IS_ENABLED(CONFIG_CPU_LITTLE_ENDIAN))
 		cmd |= OPIP_PKO_CMD_LE;
-	return cmd | OPIP_PKO_CMD_DONTFREE;
+	if (!free)
+		cmd |= OPIP_PKO_CMD_DONTFREE;
+	return cmd;
 }
 
 /* The buffer pointer for a packet the CPU built (always inline: as above) */
@@ -161,6 +178,18 @@ static __always_inline void opip_tx_maybe_stop(struct netdev_queue *txq,
 	if (!netif_txq_maybe_stop(txq, opip_txq_free_slots(q), 2,
 				  OPIP_TX_WAKE_THRESH))
 		WRITE_ONCE(q->stopped, q->stopped + 1);
+}
+
+/*
+ * XDP sends on the queue of the CPU, as far as there are queues. One
+ * queue per CPU is the common case, and takes no division: the core
+ * stalls on the divider for the length of a division.
+ */
+static unsigned int opip_xdp_txq(struct net_device *dev, unsigned int cpu)
+{
+	unsigned int queues = dev->real_num_tx_queues;
+
+	return likely(cpu < queues) ? cpu : cpu % queues;
 }
 
 /* Tell the PKO about the command words written since the last doorbell */
@@ -207,6 +236,7 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 	struct netdev_queue *txq = netdev_get_tx_queue(dev, qid);
 	unsigned int head = q->head, n, pkts;
 	unsigned int bytes = 0, skbs = 0;
+	struct xdp_frame_bulk bq;
 	u32 sent;
 
 	sent = -opip_fau_rd32(q->fau);
@@ -223,9 +253,14 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 		n = q->tail - head;
 	pkts = n;
 
+	xdp_frame_bulk_init(&bq);
+	rcu_read_lock();
 	while (n--) {
 		unsigned long entry = q->ring[head++ & (OPIP_TXQ_RING - 1)];
 		struct sk_buff *skb = opip_tx_entry_skb(entry);
+		struct xdp_frame *xdpf;
+
+		xdpf = opip_tx_entry_xdpf(entry);
 
 		/* The next one was sent long ago, its lines have gone */
 		if (n)
@@ -238,8 +273,13 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 			bytes += skb->len;
 			skbs++;
 			napi_consume_skb(skb, budget);
+		} else if (xdpf) {
+			bytes += xdpf->len;
+			xdp_return_frame_bulk(xdpf, &bq);
 		}
 	}
+	xdp_flush_frame_bulk(&bq);
+	rcu_read_unlock();
 	WRITE_ONCE(q->skbs, q->skbs - skbs);
 	WRITE_ONCE(q->head, head);
 
@@ -417,7 +457,9 @@ void opip_txq_free(struct opip_txq *q)
  * @q: The queue, the PKO reset
  *
  * Only for the teardown: while the PKO runs, its engine may hold a packet
- * of the queue that no count shows, see opip_tx_timeout().
+ * of the queue that no count shows, see opip_tx_timeout(). The buffers of
+ * an XDP_TX packet are not freed: only the PKO frees them (its entry has
+ * no address).
  *
  * Return: how many packets were freed
  */
@@ -428,6 +470,9 @@ unsigned int opip_txq_purge(struct opip_txq *q)
 	for (head = q->head; head != q->tail; head++, freed++) {
 		unsigned long entry = q->ring[head & (OPIP_TXQ_RING - 1)];
 		struct sk_buff *skb = opip_tx_entry_skb(entry);
+		struct xdp_frame *xdpf;
+
+		xdpf = opip_tx_entry_xdpf(entry);
 
 		if (skb) {
 			if (entry & OPIP_TX_GATHER)
@@ -435,6 +480,8 @@ unsigned int opip_txq_purge(struct opip_txq *q)
 					      OPIP_POOL_WQE, 0);
 			skbs++;
 			dev_kfree_skb_any(skb);
+		} else if (xdpf) {
+			xdp_return_frame(xdpf);
 		}
 	}
 	WRITE_ONCE(q->skbs, q->skbs - skbs);
@@ -536,6 +583,34 @@ netdev_features_t opip_features_check(struct sk_buff *skb,
  */
 DEFINE_STATIC_KEY_FALSE(opip_gmx401);
 
+/*
+ * Pad an XDP_TX runt within its packet pool buffer (a program may have
+ * moved the data up to the end of it).
+ *
+ * Return: the buffer pointer with the new size, 0 without the room
+ */
+static noinline __cold u64 opip_xdp_tx_pad_gmx401(u64 buf, unsigned int len)
+{
+	u64 addr = opip_buf_addr(buf);
+
+	if (addr + 64 > opip_buf_start(buf) + OPIP_POOL_PACKET_SIZE)
+		return 0;
+	memset(opip_virt(addr) + len, 0, 64 - len);
+	return u64_replace_bits(buf, 64, OPIP_BUF_SIZE);
+}
+
+/* Pad a runt frame in its tailroom, false without the room */
+static noinline __cold bool opip_xdp_pad_gmx401(struct xdp_frame *xdpf)
+{
+	void *end = xdp_get_shared_info_from_frame(xdpf);
+
+	if (xdpf->data + 64 > end)
+		return false;
+	memset(xdpf->data + xdpf->len, 0, 64 - xdpf->len);
+	xdpf->len = 64;
+	return true;
+}
+
 /* Segments of one skb, ignoring its frag_list */
 static unsigned int opip_tx_skb_segs(const struct sk_buff *skb)
 {
@@ -602,7 +677,9 @@ static bool opip_tx_map_frags(struct sk_buff *skb, u64 *cmd, u64 *buf)
 
 /*
  * Write the command of a packet and put the packet into the ring of its
- * queue; @len is what BQL is told. Called under the transmit queue lock.
+ * queue. The packet is an skb, an XDP frame, or a buffer the PKO frees by
+ * itself (see opip_xdp_tx()), @len is what BQL is told, 0 for the last
+ * kind. Called under the transmit queue lock.
  *
  * Return: false if the command was not written, the caller frees the
  * packet
@@ -617,7 +694,7 @@ static bool opip_tx_write(struct net_device *dev, struct opip_txq *q,
 	if (WARN_ON_ONCE(q->tail - READ_ONCE(q->head) >= OPIP_TXQ_RING))
 		return false;
 
-	if (skb_is_nonlinear(skb)) {
+	if (skb && skb_is_nonlinear(skb)) {
 		if (unlikely(!opip_tx_map_frags(skb, &cmd, &buf))) {
 			WRITE_ONCE(q->no_wqe, q->no_wqe + 1);
 			return false;
@@ -637,7 +714,8 @@ static bool opip_tx_write(struct net_device *dev, struct opip_txq *q,
 	WRITE_ONCE(q->tail, q->tail + 1);
 	if (skb)
 		WRITE_ONCE(q->skbs, q->skbs + 1);
-	netdev_tx_sent_queue(netdev_get_tx_queue(dev, qid), len);
+	if (len)
+		netdev_tx_sent_queue(netdev_get_tx_queue(dev, qid), len);
 	q->doorbell += 2;
 	q->written++;
 	return true;
@@ -751,7 +829,7 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 	if (skb->sk)
 		skb_tx_timestamp(skb);
 	len = skb->len;
-	cmd = opip_pko_cmd(q, len);
+	cmd = opip_pko_cmd(q, len, false);
 	if (hw_csum >= 0)
 		cmd |= FIELD_PREP(OPIP_PKO_CMD_IPOFFP1, hw_csum + 1);
 	buf = opip_pko_buf(skb->data, len);
@@ -788,6 +866,143 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+/*
+ * The XDP_TX send of a packet in one buffer, @buf. Always inline: per
+ * packet in the receive poll.
+ */
+static __always_inline int __opip_xdp_tx(struct net_device *dev,
+					 struct opip_tx_poll *poll,
+					 unsigned long entry, u64 buf,
+					 unsigned int len)
+{
+	struct opip_port *p = opip_port(dev);
+	struct netdev_queue *txq;
+	unsigned int cpu, qid;
+	struct opip_txq *q;
+	u64 cmd;
+	bool ok;
+
+	cpu = smp_processor_id();
+	qid = opip_xdp_txq(dev, cpu);
+	q = &p->txq[qid];
+	txq = netdev_get_tx_queue(dev, qid);
+
+	/* Errata GMX-401 */
+	if (static_branch_unlikely(&opip_gmx401) &&
+	    unlikely(len < 64 && READ_ONCE(p->pad_runts))) {
+		buf = opip_xdp_tx_pad_gmx401(buf, len);
+		if (!buf)
+			return -ENOBUFS;
+		len = 64;
+	}
+
+	__netif_tx_lock(txq, cpu);
+	if (q->written >= OPIP_TX_COMPLETE_BATCH)
+		opip_tx_complete(dev, qid, q, poll->budget);
+	cmd = opip_pko_cmd(q, len, true);
+	ok = opip_txq_free_slots(q) >= 2 &&
+	     opip_tx_write(dev, q, qid, entry, 0, cmd, buf);
+	if (ok) {
+		bool marked = opip_tx_poll_mark(poll, q, dev, qid);
+
+		if (!marked || q->doorbell >= OPIP_TX_POLL_DOORBELL) {
+			opip_tx_doorbell(p, q);
+			if (!marked)
+				opip_tx_arm(q);
+		}
+	}
+	__netif_tx_unlock(txq);
+	return ok ? 0 : -ENOBUFS;
+}
+
+/**
+ * opip_xdp_tx - send a received buffer back out, for XDP_TX
+ * @dev:  The port the packet came in on
+ * @poll: The list of the receive poll, which runs this
+ * @buf:  The buffer pointer: the packet's address and size, and the lines
+ *        back to the start of the buffer
+ * @len:  Packet length
+ *
+ * Runs in the receive poll. The PKO frees the buffer to the packet pool
+ * by itself, so the packet costs no page_pool round trip; its ring entry
+ * only counts it in flight. BQL is not told about it.
+ *
+ * Return: 0, or -ENOBUFS when the caller has to free the buffer (no room
+ * in the ring, or none in the buffer for the GMX-401 padding)
+ */
+int opip_xdp_tx(struct net_device *dev, struct opip_tx_poll *poll, u64 buf,
+		unsigned int len)
+{
+	return __opip_xdp_tx(dev, poll, OPIP_TX_XDP, buf, len);
+}
+
+/**
+ * opip_xdp_xmit - send XDP frames, the port as a redirect target
+ * @dev:    Port
+ * @n:      Number of frames
+ * @frames: The frames, the caller frees the ones not sent
+ * @flags:  XDP_XMIT_FLUSH or nothing
+ *
+ * The frames are sent on the queue of this CPU, like the stack's packets
+ * from this CPU, under the same lock. A redirect from a receive poll of
+ * this driver comes in that poll and completes under its budget; from
+ * elsewhere the queue's NAPI completes, or the transmit itself once the
+ * ring is half full, see opip_tx_batch().
+ *
+ * Return: the number of frames sent
+ */
+int opip_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+		  u32 flags)
+{
+	struct opip_port *p = opip_port(dev);
+	struct opip_tx_poll *poll;
+	struct netdev_queue *txq;
+	unsigned int cpu, qid;
+	struct opip_txq *q;
+	int i, sent = 0;
+
+	cpu = smp_processor_id();
+	qid = opip_xdp_txq(dev, cpu);
+	q = &p->txq[qid];
+	txq = netdev_get_tx_queue(dev, qid);
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+	if (unlikely(!netif_running(dev) || !netif_carrier_ok(dev)))
+		return -ENETDOWN;
+
+	/* Bottom halves are off, never an interrupt: see opip_xmit() */
+	poll = __this_cpu_read(opip_tx_poll_cur);
+	__netif_tx_lock(txq, cpu);
+	if (q->written >= OPIP_TX_COMPLETE_BATCH)
+		opip_tx_batch(dev, qid, q, poll);
+	for (i = 0; i < n; i++) {
+		struct xdp_frame *xdpf = frames[i];
+
+		/*
+		 * No frame with fragments: without NETDEV_XDP_ACT_NDO_XMIT_SG
+		 * the devmap does not send one here
+		 */
+		DEBUG_NET_WARN_ON_ONCE(xdp_frame_has_frags(xdpf));
+		if (opip_txq_free_slots(q) < 2)
+			break;
+		/* Errata GMX-401 */
+		if (static_branch_unlikely(&opip_gmx401) && xdpf->len < 64 &&
+		    READ_ONCE(p->pad_runts) && !opip_xdp_pad_gmx401(xdpf))
+			break;
+		if (!opip_tx_write(dev, q, qid,
+				   (unsigned long)xdpf | OPIP_TX_XDP,
+				   xdpf->len, opip_pko_cmd(q, xdpf->len, false),
+				   opip_pko_buf(xdpf->data, xdpf->len)))
+			break;
+		sent++;
+	}
+	opip_tx_doorbell(p, q);
+	opip_tx_arm(q);
+	__netif_tx_unlock(txq);
+	return sent;
+}
+
 /**
  * opip_tx_poll_begin - the start of a receive poll's transmit side
  * @poll:   The poll's list
@@ -816,8 +1031,9 @@ void opip_tx_poll_begin(struct opip_tx_poll *poll, int budget)
  * over its edge, so a part of every poll's skbs went through the slab and
  * came back cold (the stateful IPv6 forwarding rate). Completing them
  * here, spread over the builds, keeps the cache in the middle. A queue is
- * read while it has skbs in flight. The queues are the ones the polls
- * kept on the list, see opip_tx_poll_end().
+ * read while it has skbs in flight: XDP_TX sends buffers the hardware
+ * frees, nothing to recycle, and pays nothing. The queues are the ones
+ * the polls kept on the list, see opip_tx_poll_end().
  */
 void opip_tx_poll_tick(struct opip_tx_poll *poll)
 {
@@ -927,7 +1143,8 @@ static unsigned int opip_tx_complete_dev(struct net_device *dev)
  * forwarded one) that netpoll would free right away from its completion
  * queue, with interrupts off, which the pool's return does not allow,
  * comes off the ring onto the queue's list for the NAPI (a panic never
- * frees it, which is fine).
+ * frees it, which is fine). The completion stops at an XDP frame, whose
+ * return needs bottom halves on as well.
  */
 void opip_tx_netpoll(struct net_device *dev)
 {
@@ -949,6 +1166,8 @@ void opip_tx_netpoll(struct net_device *dev)
 				q->ring[head & (OPIP_TXQ_RING - 1)];
 			struct sk_buff *skb = opip_tx_entry_skb(entry);
 
+			if (opip_tx_entry_xdpf(entry))
+				break;
 			if (skb) {
 				if (entry & OPIP_TX_GATHER)
 					opip_fpa_free(*opip_tx_skb_list(skb),

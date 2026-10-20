@@ -26,9 +26,11 @@
 #include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <net/xdp.h>
 
 #include "octeon_pip_hw.h"
 
+struct bpf_prog;
 struct page_pool;
 struct platform_device;
 
@@ -85,6 +87,15 @@ struct platform_device;
 /* Ethernet header, FCS and a VLAN tag on top of the MTU */
 #define OPIP_MTU_OVERHEAD	(ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN)
 #define OPIP_MAX_FRAME		65392
+
+/*
+ * The MTU up to which a packet sits in one buffer, what XDP needs: the
+ * first buffer's data part holds the largest frame the MAC accepts at
+ * that MTU (OPIP_MTU_OVERHEAD, the FCS counted, which the IPD keeps while
+ * the 10 Mbit/s preamble workaround runs)
+ */
+#define OPIP_XDP_MAX_MTU	(OPIP_POOL_PACKET_SIZE - OPIP_BUF_LINK_SIZE - \
+				 OPIP_FIRST_SKIP - OPIP_MTU_OVERHEAD)
 
 /* ------------------------------------------------------------------ */
 
@@ -224,6 +235,8 @@ struct opip_port {
 	/* The first PKO output queue, and how many the port has */
 	int base_queue;
 	int num_queues;
+	/* The XDP program, read for every packet */
+	struct bpf_prog __rcu	*xdp_prog;
 	phy_interface_t		phy_mode;
 	/* The link as phylink last set it up, for the RGMII preamble check */
 	struct opip_link	link;
@@ -252,6 +265,8 @@ struct opip_port {
 	unsigned long pcs_an_error;
 	unsigned long pcs_tx_fifo_error;
 	struct opip_txq		txq[OPIP_MAX_TXQS];
+	/* The receive groups are the port's XDP receive queues */
+	struct xdp_rxq_info	xdp_rxq[OPIP_MAX_GROUPS];
 	struct phylink		*phylink;
 	struct phylink_config	phylink_config;
 	/* The PCS of an SGMII port */
@@ -270,9 +285,9 @@ struct opip_port {
 #define OPIP_GROUP_IRQ_DISABLED	0
 
 /*
- * The queues a receive poll sent on, and the budget the core gave the
- * poll: what the poll completes goes into the per-CPU NAPI skb cache
- * under it
+ * The queues a receive poll sent on, the doorbells of its XDP_TX packets
+ * deferred, and the budget the core gave the poll: what the poll
+ * completes goes into the per-CPU NAPI skb cache under it
  */
 struct opip_tx_poll {
 	int budget;
