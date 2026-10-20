@@ -92,6 +92,24 @@ config OCTEON_MGMT_ETHERNET
 	  port on Cavium Networks' Octeon CN57XX, CN56XX, CN55XX,
 	  CN54XX, CN52XX, and CN6XXX chips.
 
+config OCTEON_PIP_ETHERNET
+	tristate "Octeon PIP/PKO Ethernet ports driver (CN3XXX-CN7XXX)"
+	depends on CAVIUM_OCTEON_SOC || COMPILE_TEST
+	depends on 64BIT
+	depends on !CAVIUM_OCTEON_SOC || OCTEON_ETHERNET=n
+	help
+	  Driver for the Ethernet ports behind the packet input (PIP/IPD)
+	  and packet output (PKO) units of the Cavium OCTEON, OCTEON+,
+	  OCTEON II and the smaller OCTEON III models (CN70XX/CN71XX):
+	  the SGMII, QSGMII, 1000BASE-X, RGMII, GMII and XAUI ports, and
+	  the NPI and loopback ports.
+
+	  The staging driver octeon-ethernet (OCTEON_ETHERNET) drives the
+	  same hardware. On OCTEON only one of the two can be built.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called octeon_pip.
+
 config LIQUIDIO_VF
 	tristate "Cavium LiquidIO VF support"
 	depends on 64BIT && PCI_MSI

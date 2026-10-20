@@ -5944,6 +5944,13 @@ S:	Odd Fixes
 W:	http://www.marvell.com
 F:	drivers/mmc/host/cavium*
 
+CAVIUM OCTEON PIP ETHERNET DRIVER
+M:	Simon Polack <spolack+git@mailbox.org>
+L:	netdev@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/net/cavium,octeon-3860-pip.yaml
+F:	drivers/net/ethernet/cavium/octeon/octeon_pip*
+
 CAVIUM OCTEON-TX CRYPTO DRIVER
 M:	George Cherian <gcherian@marvell.com>
 L:	linux-crypto@vger.kernel.org
