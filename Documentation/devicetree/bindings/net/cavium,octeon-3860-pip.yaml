@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/cavium,octeon-3860-pip.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Cavium OCTEON PIP Ethernet nexus
+
+maintainers:
+  - Simon Polack <spolack+git@mailbox.org>
+
+description:
+  The packet input (PIP/IPD) and packet output (PKO) units of the Cavium
+  OCTEON SoCs (CN3XXX, CN5XXX, CN6XXX, CNF71XX, CN70XX and CN71XX) serve
+  the Ethernet ports of the chip. The ports are grouped in two levels, the
+  interfaces of the chip (a GMX block with up to four
+  RGMII/GMII/SGMII/QSGMII/1000BASE-X MACs or one XAUI MAC, a SPI-4.2
+  interface with up to sixteen ports, the PCI packet interface, the
+  loopback ports) and the ports of each interface. The mode of an
+  interface is set by the chip's straps and serdes configuration.
+
+properties:
+  $nodename:
+    pattern: "^pip@[0-9a-f]+$"
+
+  compatible:
+    const: cavium,octeon-3860-pip
+
+  reg:
+    maxItems: 1
+
+  "#address-cells":
+    const: 1
+
+  "#size-cells":
+    const: 0
+
+patternProperties:
+  "^interface@[0-9a-f]+$":
+    type: object
+    description:
+      One interface of the chip, a GMX block, a SPI-4.2 interface, the PCI
+      packet interface or the loopback ports.
+    additionalProperties: false
+
+    properties:
+      compatible:
+        const: cavium,octeon-3860-pip-interface
+
+      reg:
+        maxItems: 1
+        description: The interface number.
+
+      "#address-cells":
+        const: 1
+
+      "#size-cells":
+        const: 0
+
+    patternProperties:
+      "^ethernet@[0-9a-f]+$":
+        $ref: ethernet-controller.yaml#
+        unevaluatedProperties: false
+        description:
+          One port of the interface, a MAC. An RGMII port with neither
+          phy-handle nor fixed-link takes its link state from the RGMII
+          in-band status of the link partner. On CN30XX and CN50XX port 0
+          can be strapped to MII, else it is RGMII, on a GMII interface
+          too; port 1 of a GMII interface runs GMII, or MII at 10 and 100
+          Mbit/s.
+
+        properties:
+          compatible:
+            const: cavium,octeon-3860-pip-port
+
+          reg:
+            maxItems: 1
+            description: The port number within the interface.
+
+          phy-mode:
+            enum:
+              - rgmii
+              - rgmii-id
+              - rgmii-rxid
+              - rgmii-txid
+              - mii
+              - gmii
+              - sgmii
+              - qsgmii
+              - 1000base-x
+              - xaui
+
+          rx-delay:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            minimum: 0
+            maximum: 31
+            deprecated: true
+            description:
+              Setting of the RGMII receive clock delay line of the MAC
+              (ASX), 0 for no delay. The time of a step is not
+              documented and depends on the chip.
+
+          tx-delay:
+            $ref: /schemas/types.yaml#/definitions/uint32
+            minimum: 0
+            maximum: 31
+            deprecated: true
+            description:
+              Setting of the RGMII transmit clock delay line of the MAC
+              (ASX), 0 for no delay. The time of a step is not
+              documented and depends on the chip.
+
+          # The ASX delay lines have steps of no documented time
+          rx-internal-delay-ps: false
+          tx-internal-delay-ps: false
+
+          cavium,alt-phy-handle:
+            $ref: /schemas/types.yaml#/definitions/phandle
+            description:
+              The PHY of the port on board variants with a different PHY
+              population.
+
+        required:
+          - compatible
+          - reg
+
+    required:
+      - compatible
+      - reg
+      - "#address-cells"
+      - "#size-cells"
+
+required:
+  - compatible
+  - reg
+  - "#address-cells"
+  - "#size-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    bus {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        pip@11800a0000000 {
+            compatible = "cavium,octeon-3860-pip";
+            reg = <0x11800 0xa0000000 0x0 0x2000>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            interface@0 {
+                compatible = "cavium,octeon-3860-pip-interface";
+                reg = <0>;
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                ethernet@0 {
+                    compatible = "cavium,octeon-3860-pip-port";
+                    reg = <0x0>;
+                    phy-mode = "rgmii-id";
+                    phy-handle = <&phy7>;
+                    nvmem-cells = <&macaddr_eeprom 0>;
+                    nvmem-cell-names = "mac-address";
+                };
+
+                ethernet@1 {
+                    compatible = "cavium,octeon-3860-pip-port";
+                    reg = <0x1>;
+                    phy-mode = "rgmii-id";
+                    phy-handle = <&phy6>;
+                    nvmem-cells = <&macaddr_eeprom 1>;
+                    nvmem-cell-names = "mac-address";
+                };
+
+                ethernet@2 {
+                    compatible = "cavium,octeon-3860-pip-port";
+                    reg = <0x2>;
+                    phy-mode = "rgmii-txid";
+                    local-mac-address = [ 00 0f b7 10 63 64 ];
+
+                    fixed-link {
+                        speed = <1000>;
+                        full-duplex;
+                    };
+                };
+            };
+        };
+    };
