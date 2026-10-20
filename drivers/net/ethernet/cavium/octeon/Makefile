@@ -15,4 +15,5 @@ octeon_pip-y += octeon_pip_link.o
 octeon_pip-y += octeon_pip_pcs.o
 octeon_pip-y += octeon_pip_pko.o
 octeon_pip-y += octeon_pip_pow.o
+octeon_pip-y += octeon_pip_rx.o
 octeon_pip-y += octeon_pip_tx.o

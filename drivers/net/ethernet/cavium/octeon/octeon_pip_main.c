@@ -34,6 +34,7 @@
 #include "octeon_pip_pko.h"
 #include "octeon_pip_pow.h"
 #include "octeon_pip_regs.h"
+#include "octeon_pip_rx.h"
 #include "octeon_pip_tx.h"
 
 /* PKO command chunks put in the chunk pool */
@@ -118,6 +119,15 @@ void opip_port_enable(struct opip_port *p, bool en)
 	mutex_lock(&p->opip->hw_lock);
 	opip_gmx_port_enable(p->iface->num, p->index, en, p->port);
 	mutex_unlock(&p->opip->hw_lock);
+}
+
+static void opip_refill_worker(struct work_struct *work)
+{
+	struct opip *opip = container_of(work, struct opip, refill_work.work);
+
+	opip_rx_refill_check(opip);
+	if (!READ_ONCE(opip->stopping))
+		schedule_delayed_work(&opip->refill_work, HZ);
 }
 
 /* ------------------------------------------------------------------ */
@@ -239,6 +249,16 @@ static int opip_set_mac_address(struct net_device *dev, void *addr)
 static int opip_ndo_init(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
+	unsigned int i;
+
+	/*
+	 * Receive queue i is group i, whose NAPI is on opip->napi_dev and
+	 * outlives the registration.
+	 */
+	for (i = 0; i < OPIP_MAX_GROUPS; i++)
+		if (p->opip->groups_mask & BIT(i))
+			netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_RX,
+					     &p->opip->groups[i].napi);
 
 	opip_set_mac_filter(dev);
 	opip_set_hw_mtu(dev, dev->mtu);
@@ -429,6 +449,9 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	dev->min_mtu = VLAN_ETH_ZLEN - OPIP_MTU_OVERHEAD;
 	dev->max_mtu = OPIP_MAX_FRAME - OPIP_MTU_OVERHEAD;
 	dev->netdev_ops = &opip_netdev_ops;
+	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_RXHASH;
+	dev->features |= dev->hw_features;
+	dev->vlan_features |= dev->hw_features;
 
 	/*
 	 * opip_probe() has waited for the nvmem cells: a failure here is final
@@ -967,11 +990,12 @@ static void opip_iface_disable_unused(struct opip *opip,
 			opip_gmx_port_enable(iface->num, index, false, 0);
 }
 
-/* The interfaces on */
+/* Packet input on: the IPD, the interfaces */
 static void opip_input_enable(struct opip *opip)
 {
 	int i;
 
+	opip_ipd_enable();
 	for (i = 0; i < opip->num_ifaces; i++) {
 		if (!opip->ifaces[i].num_ports)
 			continue;
@@ -980,12 +1004,28 @@ static void opip_input_enable(struct opip *opip)
 	}
 }
 
-/* Undo opip_hw_init() */
-static void opip_free_hw(struct opip *opip)
+/*
+ * Undo opip_hw_init() and what the ports put into the pools. @drain once
+ * input ran: before, the IPD's FIFOs hold nothing of this driver, and the
+ * port FIFO, walked whole, holds what an earlier user left there.
+ */
+static void opip_free_hw(struct opip *opip, bool drain)
 {
+	unsigned int owed = 0;
+	int i;
+
+	/* The polls are down: none can queue the refill worker again */
+	cancel_delayed_work_sync(&opip->refill_work);
+	/* What the polls still owe the packet pool is not in it */
+	for (i = 0; i < OPIP_MAX_GROUPS; i++)
+		owed += opip->groups[i].to_refill;
 	opip_pko_reset();
+	if (drain)
+		opip_ipd_drain();
+	opip_fpa_empty_packet_pool(opip, opip->num_packet_buffers - owed);
 	/* The IPD's count of the packet pool is zero again with the pool */
 	opip_ipd_reset();
+	opip_rx_free_pools(opip);
 	opip_fpa_empty(opip, OPIP_POOL_WQE, opip->wqe_bufs);
 	opip_fpa_empty(opip, OPIP_POOL_CMD, opip->cmd_bufs);
 }
@@ -1108,13 +1148,23 @@ static void opip_pko_stop(void)
 	opip_pko_reset();
 }
 
-/* Take the driver down in the order its parts depend on each other */
+/*
+ * Take the driver down in the order its parts depend on each other: input
+ * off, the devices unregistered (each drains its queues), the PKO off, the
+ * groups down, and only then the devices and the hardware freed.
+ */
 static void opip_teardown(struct opip *opip)
 {
+	opip_ipd_disable();
+	WRITE_ONCE(opip->stopping, true);
+	cancel_delayed_work_sync(&opip->refill_work);
+
 	opip_unregister_ports(opip);
 	opip_pko_stop();
+	opip_rx_shutdown(opip);
 	opip_free_ports(opip);
-	opip_free_hw(opip);
+	opip_free_hw(opip, true);
+	free_netdev(opip->napi_dev);
 }
 
 static void opip_remove(struct platform_device *pdev)
@@ -1153,6 +1203,11 @@ static int opip_wait_for_mac_addresses(struct device_node *pip)
 	return 0;
 }
 
+static void opip_free(void *opip)
+{
+	kfree(opip);
+}
+
 static int opip_probe(struct platform_device *pdev)
 {
 	struct device_node *pip = pdev->dev.of_node;
@@ -1178,16 +1233,47 @@ static int opip_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	opip = devm_kzalloc(&pdev->dev, sizeof(*opip), GFP_KERNEL);
+	/*
+	 * Not devm_kzalloc(): the devres header in front of it would leave
+	 * the groups off the cache line alignment of struct opip_group
+	 */
+	opip = kzalloc_obj(*opip);
 	if (!opip)
 		return -ENOMEM;
-	opip->pdev = pdev;
-	mutex_init(&opip->hw_lock);
-	platform_set_drvdata(pdev, opip);
-
-	ret = opip_hw_init(opip);
+	ret = devm_add_action_or_reset(&pdev->dev, opip_free, opip);
 	if (ret)
 		return ret;
+	opip->pdev = pdev;
+	mutex_init(&opip->hw_lock);
+	INIT_DELAYED_WORK(&opip->refill_work, opip_refill_worker);
+	platform_set_drvdata(pdev, opip);
+
+	/*
+	 * The receive NAPIs hang off a dummy device: a POW group delivers
+	 * the packets of every port (the PIP's tag picks the group), so its
+	 * NAPI is none of the ports'. Nobody can set the dummy's
+	 * gro_flush_timeout and napi_defer_hard_irqs from user space, so the
+	 * driver sets the software interrupt coalescing r8169, bcmgenet,
+	 * bcmasp, macb and ravb default to: a poll that ends with work done
+	 * leaves the interrupt off once (napi_defer_hard_irqs 1) and is
+	 * polled again from a 20 us timer (gro_flush_timeout), which saves
+	 * the interrupt, its disable/enable and the group's ack under a
+	 * steady load and lets GRO batches grow over polls.
+	 */
+	opip->napi_dev = alloc_netdev_dummy(0);
+	if (!opip->napi_dev)
+		return -ENOMEM;
+	netdev_sw_irq_coalesce_default_on(opip->napi_dev);
+
+	ret = opip_hw_init(opip);
+	if (ret) {
+		free_netdev(opip->napi_dev);
+		return ret;
+	}
+
+	ret = opip_rx_init(opip);
+	if (ret)
+		goto err_hw;
 
 	if (!opip_alloc_ports(opip, pip)) {
 		dev_err(&pdev->dev, "no usable ports\n");
@@ -1203,14 +1289,18 @@ static int opip_probe(struct platform_device *pdev)
 		goto err_input;
 	}
 
+	schedule_delayed_work(&opip->refill_work, HZ);
 	return 0;
 
 err_input:
 	opip_teardown(opip);
 	return ret;
 err_ports:
+	opip_rx_shutdown(opip);
 	opip_free_ports(opip);
-	opip_free_hw(opip);
+err_hw:
+	opip_free_hw(opip, false);
+	free_netdev(opip->napi_dev);
 	return ret;
 }
 

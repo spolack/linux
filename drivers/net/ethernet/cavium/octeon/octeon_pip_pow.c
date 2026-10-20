@@ -48,3 +48,46 @@ void opip_pow_restore_groups(unsigned int core, u64 mask)
 		opip_wr(OPIP_POW_PP_GRP_MSK(core), mask);
 	}
 }
+
+/**
+ * opip_pow_group_ack - acknowledge a group's interrupt
+ * @group: The group
+ *
+ * The group is empty: acknowledge its interrupt.
+ */
+void opip_pow_group_ack(int group)
+{
+	if (opip_chip->cn68xx) {
+		opip_wr(OPIP_SSO_WQ_IQ_DIS, BIT_ULL(group));
+		opip_wr(OPIP_SSO_WQ_INT, BIT_ULL(group));
+	} else {
+		opip_wr(OPIP_POW_WQ_INT,
+			FIELD_PREP(OPIP_POW_WQ_INT_IQ_DIS, BIT(group)) |
+			FIELD_PREP(OPIP_POW_WQ_INT_WQ_INT, BIT(group)));
+	}
+}
+
+/**
+ * opip_pow_group_irq - turn a group's work interrupt on or off
+ * @group:  The group
+ * @enable: Turn it on
+ *
+ * Interrupt as soon as the group has work: the time counter with a
+ * threshold of one, checked every 5 * 1024 cycles.
+ */
+void opip_pow_group_irq(int group, bool enable)
+{
+	if (opip_chip->cn68xx) {
+		opip_wr(OPIP_SSO_WQ_INT_THR(group),
+			enable ? OPIP_SSO_WQ_INT_THR_TC_EN |
+				 FIELD_PREP(OPIP_SSO_WQ_INT_THR_TC_THR, 1) : 0);
+		opip_wr(OPIP_SSO_WQ_INT_PC,
+			FIELD_PREP(OPIP_POW_WQ_INT_PC_PC_THR, 5));
+	} else {
+		opip_wr(OPIP_POW_WQ_INT_THR(group),
+			enable ? OPIP_POW_WQ_INT_THR_TC_EN |
+				 FIELD_PREP(OPIP_POW_WQ_INT_THR_TC_THR, 1) : 0);
+		opip_wr(OPIP_POW_WQ_INT_PC,
+			FIELD_PREP(OPIP_POW_WQ_INT_PC_PC_THR, 5));
+	}
+}

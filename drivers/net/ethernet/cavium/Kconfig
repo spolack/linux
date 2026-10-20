@@ -99,6 +99,7 @@ config OCTEON_PIP_ETHERNET
 	depends on !CAVIUM_OCTEON_SOC || OCTEON_ETHERNET=n
 	select PHYLINK
 	select MDIO_OCTEON
+	select PAGE_POOL
 	help
 	  Driver for the Ethernet ports behind the packet input (PIP/IPD)
 	  and packet output (PKO) units of the Cavium OCTEON, OCTEON+,

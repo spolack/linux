@@ -15,7 +15,9 @@
 #include "octeon_pip_regs.h"
 
 void opip_ipd_config(void);
+void opip_ipd_enable(void);
 void opip_ipd_disable(void);
+void opip_ipd_drain(void);
 void opip_ipd_reset(void);
 void opip_ipd_red_setup(unsigned int pass, unsigned int drop);
 void opip_ipd_fcs_strip(int port, bool strip);

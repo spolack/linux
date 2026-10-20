@@ -28,6 +28,7 @@
 
 #include "octeon_pip_hw.h"
 
+struct page_pool;
 struct platform_device;
 
 /* ------------------------------------------------------------------ */
@@ -106,10 +107,46 @@ struct opip_port {
 	struct phylink_pcs	pcs;
 };
 
+/* opip_group.state */
+#define OPIP_GROUP_IRQ_DISABLED	0
+
+/*
+ * A POW group: delivers received packets to one CPU. The groups sit next
+ * to each other in struct opip: a line of their own each, so that one
+ * group's poll writing its tail (to_refill) does not share a
+ * line with the next group's head, which that group's interrupt and the
+ * kicks write (state, csd).
+ */
+struct opip_group {
+	int irq;
+	int group;
+	/* The CPU the interrupt is bound to: the poll runs there */
+	int cpu;
+	/*
+	 * Schedules the poll on that CPU from another, see
+	 * opip_group_schedule()
+	 */
+	call_single_data_t csd;
+	unsigned long state;
+	struct napi_struct napi;
+	struct opip *opip;
+	/*
+	 * The pages this group's poll puts into the packet pool. A buffer
+	 * may come back through any group: the pool is the hardware's.
+	 */
+	struct page_pool *pp;
+	/* Buffers this group's poll took out of the pool and has to replace */
+	unsigned int to_refill;
+} ____cacheline_aligned_in_smp;
+
 /* The packet I/O complex */
 struct opip {
 	struct platform_device *pdev;
-	/* The size of the packet pool */
+	/*
+	 * The size of the packet pool: the buffers free in the FPA, the ones
+	 * the IPD, the POW and the PKO hold, and the ones the polls owe
+	 * (to_refill: handed to the stack) add up to this
+	 */
 	unsigned int num_packet_buffers;
 	int num_ifaces;
 	struct opip_iface ifaces[OPIP_MAX_IFACES];
@@ -117,6 +154,9 @@ struct opip {
 	struct net_device *ports[OPIP_MAX_PORTS];
 	/* The POW groups in use */
 	unsigned int groups_mask;
+	struct opip_group groups[OPIP_MAX_GROUPS];
+	/* The NAPI instances hang off a dummy device: the groups are shared */
+	struct net_device *napi_dev;
 	/* PKO output queues per port of the GMX interfaces */
 	int queues_per_port;
 	/*
@@ -124,6 +164,9 @@ struct opip {
 	 * filters, statistics. Some wait, so it is a mutex.
 	 */
 	struct mutex hw_lock;
+	struct delayed_work refill_work;
+	/* The driver goes away: the periodic works stop */
+	bool stopping;
 	/* The hardware was released, by remove or by shutdown */
 	bool released;
 	/* What was put into the pools, to check what comes back */

@@ -45,6 +45,7 @@ struct opip_link {
 #include <asm/octeon/cvmx-fpa.h>
 #include <asm/octeon/cvmx-helper.h>
 #include <asm/octeon/cvmx-helper-errata.h>
+#include <asm/octeon/cvmx-scratch.h>
 #include <asm/octeon/cvmx-sysinfo.h>
 
 static inline u64 opip_rd(u64 addr)
@@ -88,6 +89,29 @@ static inline void *opip_virt(u64 phys)
 {
 	return cvmx_phys_to_ptr(phys);
 }
+
+/* An IOBDMA command: the hardware answers into the core's scratch memory */
+static inline void opip_iobdma(u64 cmd)
+{
+	cvmx_send_single(cmd);
+}
+
+/*
+ * The CVMSEG scratch memory of the core, where the answers to IOBDMA
+ * commands land: the hardware writes a word asynchronously, so both
+ * accessors are volatile.
+ */
+static inline u64 opip_scratch_rd(unsigned int addr)
+{
+	return cvmx_scratch_read64(addr);
+}
+
+static inline void opip_scratch_wr(unsigned int addr, u64 val)
+{
+	cvmx_scratch_write64(addr, val);
+}
+
+#define opip_iobdma_wait()	CVMX_SYNCIOBDMA
 
 static inline unsigned int opip_core(void)
 {
@@ -222,7 +246,87 @@ struct opip_wqe {
 	u8 packet_data[OPIP_WQE_DATA_BYTES];
 };
 
+/* word0 on the chips with port kinds (CN68XX) */
+#define OPIP_WQE0_PKND		GENMASK_ULL(5, 0)
+
+/* word1: length, tag, and on the older chips the input port */
+#define OPIP_WQE1_LEN		GENMASK_ULL(63, 48)
+#define OPIP_WQE1_IPPRT		GENMASK_ULL(47, 42)
+#define OPIP_WQE1_TAG		GENMASK_ULL(31, 0)
+
+/* word2: how the packet was parsed and stored */
+#define OPIP_WQE2_BUFS		GENMASK_ULL(63, 56)
+#define OPIP_WQE2_TCP_OR_UDP	BIT_ULL(18)
+#define OPIP_WQE2_IS_V6		BIT_ULL(16)
+#define OPIP_WQE2_L4_ERROR	BIT_ULL(14)
+#define OPIP_WQE2_IS_FRAG	BIT_ULL(13)
+#define OPIP_WQE2_IP_EXC	BIT_ULL(12)
+#define OPIP_WQE2_NOT_IP	BIT_ULL(9)
+#define OPIP_WQE2_RCV_ERROR	BIT_ULL(8)
+#define OPIP_WQE2_ERR_CODE	GENMASK_ULL(7, 0)
+
+/*
+ * The receive error codes the driver acts on. The PIP's counters have the
+ * codes from OVER_FCS to UNDER (3-8); the others are counted in software.
+ */
+#define OPIP_RCV_ERR_JABBER	2
+#define OPIP_RCV_ERR_OVER_FCS	3
+#define OPIP_RCV_ERR_ALIGN	5
+#define OPIP_RCV_ERR_FCS	7
+#define OPIP_RCV_ERR_UNDER	8
+#define OPIP_RCV_ERR_LENGTH	10
+
+/* The buffer pointer: a packet buffer, or a gather list */
+#define OPIP_BUF_I		BIT_ULL(63)
+#define OPIP_BUF_BACK		GENMASK_ULL(62, 59)
+#define OPIP_BUF_POOL		GENMASK_ULL(58, 56)
+#define OPIP_BUF_SIZE		GENMASK_ULL(55, 40)
+#define OPIP_BUF_ADDR		GENMASK_ULL(39, 0)
+
 /* POW tag types */
 #define OPIP_TAG_ORDERED	0
+
+static inline unsigned int opip_wqe_len(const struct opip_wqe *wqe)
+{
+	return FIELD_GET(OPIP_WQE1_LEN, wqe->word1);
+}
+
+static inline u32 opip_wqe_tag(const struct opip_wqe *wqe)
+{
+	return FIELD_GET(OPIP_WQE1_TAG, wqe->word1);
+}
+
+static inline unsigned int opip_wqe_bufs(const struct opip_wqe *wqe)
+{
+	return FIELD_GET(OPIP_WQE2_BUFS, wqe->word2);
+}
+
+static inline unsigned int opip_wqe_err_code(const struct opip_wqe *wqe)
+{
+	return FIELD_GET(OPIP_WQE2_ERR_CODE, wqe->word2);
+}
+
+static inline u64 opip_buf_addr(u64 buf)
+{
+	return FIELD_GET(OPIP_BUF_ADDR, buf);
+}
+
+/* The start of the buffer a pointer points into */
+static inline u64 opip_buf_start(u64 buf)
+{
+	return ((opip_buf_addr(buf) >> 7) - FIELD_GET(OPIP_BUF_BACK, buf)) << 7;
+}
+
+/*
+ * The link pointer to a packet's next buffer sits in the eight bytes
+ * before a buffer's data; a buffer holds that much less data
+ */
+#define OPIP_BUF_LINK_SIZE	8
+
+/* The next segment's pointer, before a segment */
+static inline u64 opip_buf_next(u64 buf)
+{
+	return *(u64 *)opip_virt(opip_buf_addr(buf) - OPIP_BUF_LINK_SIZE);
+}
 
 #endif /* OCTEON_PIP_HW_H */

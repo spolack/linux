@@ -25,6 +25,18 @@ enum {
 
 #define OCTEON_IS_MODEL(x)	((void)(x), false)
 
+enum octeon_feature {
+	OCTEON_FEATURE_NO_WPTR,
+};
+
+static inline bool octeon_has_feature(enum octeon_feature feature)
+{
+	return false;
+}
+
+/* The POW group interrupts */
+#define OCTEON_IRQ_WORKQ0	0
+
 static inline u64 opip_rd(u64 addr)
 {
 	return 0;
@@ -48,6 +60,19 @@ static inline void opip_fpa_free_nosync(void *buf, int pool,
 {
 }
 
+static inline void opip_iobdma(u64 cmd)
+{
+}
+
+static inline u64 opip_scratch_rd(unsigned int addr)
+{
+	return 0;
+}
+
+static inline void opip_scratch_wr(unsigned int addr, u64 val)
+{
+}
+
 static inline int opip_num_interfaces(void)
 {
 	return 0;
@@ -57,6 +82,8 @@ static inline enum opip_mode opip_iface_mode(int iface)
 {
 	return OPIP_MODE_DISABLED;
 }
+
+#define opip_iobdma_wait()	barrier()
 
 static inline u64 opip_phys(const void *ptr)
 {

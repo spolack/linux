@@ -65,15 +65,217 @@ void opip_ipd_config(void)
 }
 
 /**
+ * opip_ipd_enable - start packet input
+ *
+ * Sets IPD_EN in IPD_CTL_STATUS, after opip_ipd_config().
+ */
+void opip_ipd_enable(void)
+{
+	opip_wr(OPIP_IPD_CTL_STATUS,
+		opip_rd(OPIP_IPD_CTL_STATUS) | OPIP_IPD_CTL_STATUS_IPD_EN);
+}
+
+/**
  * opip_ipd_disable - stop packet input
  *
  * Clears IPD_EN in IPD_CTL_STATUS. The buffers the IPD holds stay with
- * it.
+ * it, see opip_ipd_drain().
  */
 void opip_ipd_disable(void)
 {
 	opip_wr(OPIP_IPD_CTL_STATUS,
 		opip_rd(OPIP_IPD_CTL_STATUS) & ~OPIP_IPD_CTL_STATUS_IPD_EN);
+}
+
+/* The buffer a pointer FIFO entry holds, back to its pool */
+static void opip_ipd_free_fifo_buf(u64 ptr_field, int pool)
+{
+	opip_fpa_free(opip_virt(ptr_field << 7), pool, 0);
+}
+
+/*
+ * Walk a pointer FIFO of the IPD: select each entry with CENA clear, read
+ * its pointer and free the buffer, then put the FIFO back to normal. The
+ * pointer is in the control register, or in @val_reg (CN68XX's free FIFO).
+ */
+static void opip_ipd_free_fifo(u64 reg, unsigned int count, u64 raddr_mask,
+			       u64 cena, u64 val_reg, u64 ptr_mask, int pool,
+			       unsigned int (*raddr)(u64 ctl, unsigned int i))
+{
+	u64 ctl = opip_rd(reg);
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		u64 val;
+
+		ctl &= ~cena;
+		ctl = opip_field_set_var(ctl, raddr_mask, raddr(ctl, i));
+		opip_wr(reg, ctl);
+		ctl = opip_rd(reg);
+		val = val_reg ? opip_rd(val_reg) : ctl;
+		opip_ipd_free_fifo_buf((val & ptr_mask) >> __ffs64(ptr_mask),
+				       pool);
+	}
+	opip_wr(reg, ctl | cena);
+}
+
+static unsigned int opip_ipd_pwp_wqe_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_PWP_FIFO_MAX_CNTS, ctl);
+
+	return max + (FIELD_GET(OPIP_IPD_PWP_FIFO_WRADDR, ctl) + i) % max;
+}
+
+static unsigned int opip_ipd_pwp_pkt_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_PWP_FIFO_MAX_CNTS, ctl);
+
+	return (FIELD_GET(OPIP_IPD_PWP_FIFO_PRADDR, ctl) + i) % max;
+}
+
+static unsigned int opip_ipd_prc_port_raddr(u64 ctl, unsigned int i)
+{
+	return i % FIELD_GET(OPIP_IPD_PRC_PORT_FIFO_MAX_PKT, ctl);
+}
+
+static unsigned int opip_ipd_prc_hold_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_PRC_HOLD_FIFO_MAX_PKT, ctl);
+
+	return (FIELD_GET(OPIP_IPD_PRC_HOLD_FIFO_PRADDR, ctl) + i) % max;
+}
+
+static unsigned int opip_ipd_free_wqe_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_FREE_FIFO_MAX_CNTS, ctl);
+
+	return max + (FIELD_GET(OPIP_IPD_FREE_FIFO_WRADDR, ctl) + i) % max;
+}
+
+static unsigned int opip_ipd_free_pkt_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_FREE_FIFO_MAX_CNTS, ctl);
+
+	return (FIELD_GET(OPIP_IPD_FREE_FIFO_PRADDR, ctl) + i) % max;
+}
+
+static unsigned int opip_ipd_port_raddr(u64 ctl, unsigned int i)
+{
+	return i % FIELD_GET(OPIP_IPD_PORT_FIFO_MAX_PKT, ctl);
+}
+
+static unsigned int opip_ipd_hold_raddr(u64 ctl, unsigned int i)
+{
+	unsigned int max = FIELD_GET(OPIP_IPD_HOLD_FIFO_MAX_PKT, ctl);
+
+	return (FIELD_GET(OPIP_IPD_HOLD_FIFO_PRADDR, ctl) + i) % max;
+}
+
+/*
+ * CN68XX: the same FIFOs in other registers, 33-bit pointers; the work
+ * queue entries and packet pointers share the free FIFO, whose entries
+ * are read through IPD_FREE_PTR_VALUE
+ */
+static void opip_ipd_drain_cn68xx(u64 count, int wqe_pool)
+{
+	u64 ptr;
+
+	if (count & OPIP_IPD_PTR_COUNT_WQEV_CNT) {
+		ptr = opip_rd(OPIP_IPD_NEXT_WQE_PTR);
+		opip_ipd_free_fifo_buf(FIELD_GET(OPIP_IPD_PTR_VALUE_PTR, ptr),
+				       wqe_pool);
+	}
+	opip_ipd_free_fifo(OPIP_IPD_FREE_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_WQE_PCNT, count),
+			   OPIP_IPD_FREE_FIFO_RADDR, OPIP_IPD_FREE_FIFO_CENA,
+			   OPIP_IPD_FREE_PTR_VALUE, OPIP_IPD_PTR_VALUE_PTR,
+			   wqe_pool, opip_ipd_free_wqe_raddr);
+
+	if (count & OPIP_IPD_PTR_COUNT_PKTV_CNT) {
+		ptr = opip_rd(OPIP_IPD_NEXT_PKT_PTR);
+		opip_ipd_free_fifo_buf(FIELD_GET(OPIP_IPD_PTR_VALUE_PTR, ptr),
+				       OPIP_POOL_PACKET);
+	}
+	opip_ipd_free_fifo(OPIP_IPD_PORT_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PORT_FIFO_MAX_PKT,
+				     opip_rd(OPIP_IPD_PORT_PTR_FIFO_CTL)),
+			   OPIP_IPD_PORT_FIFO_RADDR, OPIP_IPD_PORT_FIFO_CENA,
+			   0, OPIP_IPD_PORT_FIFO_PTR, OPIP_POOL_PACKET,
+			   opip_ipd_port_raddr);
+	opip_ipd_free_fifo(OPIP_IPD_HOLD_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_PFIF_CNT, count),
+			   OPIP_IPD_HOLD_FIFO_RADDR, OPIP_IPD_HOLD_FIFO_CENA,
+			   0, OPIP_IPD_HOLD_FIFO_PTR, OPIP_POOL_PACKET,
+			   opip_ipd_hold_raddr);
+	opip_ipd_free_fifo(OPIP_IPD_FREE_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_PKT_PCNT, count),
+			   OPIP_IPD_FREE_FIFO_RADDR, OPIP_IPD_FREE_FIFO_CENA,
+			   OPIP_IPD_FREE_PTR_VALUE, OPIP_IPD_PTR_VALUE_PTR,
+			   OPIP_POOL_PACKET, opip_ipd_free_pkt_raddr);
+}
+
+/**
+ * opip_ipd_drain - take the buffers out of the disabled IPD and reset it
+ *
+ * The IPD holds prefetched work queue entries and packet buffers in its
+ * FIFOs. They go back to their pools, then the IPD and the PIP are reset,
+ * so that the pools can be emptied (CN38XX pass 1 and 2, which cannot
+ * read the pointers out, are refused at probe). The caller resets the IPD
+ * again once the packet pool is empty, see opip_ipd_reset().
+ */
+void opip_ipd_drain(void)
+{
+	int wqe_pool = OPIP_POOL_WQE;
+	u64 count, ptr;
+
+	/* CN52XX and CN56XX can take the entries from the packet pool */
+	if (octeon_has_feature(OCTEON_FEATURE_NO_WPTR) &&
+	    (opip_rd(OPIP_IPD_CTL_STATUS) & OPIP_IPD_CTL_STATUS_NO_WPTR))
+		wqe_pool = OPIP_POOL_PACKET;
+
+	count = opip_rd(OPIP_IPD_PTR_COUNT);
+	if (opip_chip->cn68xx) {
+		opip_ipd_drain_cn68xx(count, wqe_pool);
+		opip_ipd_reset();
+		return;
+	}
+
+	if (count & OPIP_IPD_PTR_COUNT_WQEV_CNT) {
+		ptr = FIELD_GET(OPIP_IPD_PTR_VALID_PTR,
+				opip_rd(OPIP_IPD_WQE_PTR_VALID));
+		opip_ipd_free_fifo_buf(ptr, wqe_pool);
+	}
+	opip_ipd_free_fifo(OPIP_IPD_PWP_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_WQE_PCNT, count),
+			   OPIP_IPD_PWP_FIFO_RADDR, OPIP_IPD_PWP_FIFO_CENA,
+			   0, OPIP_IPD_PWP_FIFO_PTR, wqe_pool,
+			   opip_ipd_pwp_wqe_raddr);
+
+	if (count & OPIP_IPD_PTR_COUNT_PKTV_CNT) {
+		ptr = FIELD_GET(OPIP_IPD_PTR_VALID_PTR,
+				opip_rd(OPIP_IPD_PKT_PTR_VALID));
+		opip_ipd_free_fifo_buf(ptr, OPIP_POOL_PACKET);
+	}
+	opip_ipd_free_fifo(OPIP_IPD_PRC_PORT_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PRC_PORT_FIFO_MAX_PKT,
+				     opip_rd(OPIP_IPD_PRC_PORT_PTR_FIFO_CTL)),
+			   OPIP_IPD_PRC_PORT_FIFO_RADDR,
+			   OPIP_IPD_PRC_PORT_FIFO_CENA, 0,
+			   OPIP_IPD_PRC_PORT_FIFO_PTR, OPIP_POOL_PACKET,
+			   opip_ipd_prc_port_raddr);
+	opip_ipd_free_fifo(OPIP_IPD_PRC_HOLD_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_PFIF_CNT, count),
+			   OPIP_IPD_PRC_HOLD_FIFO_RADDR,
+			   OPIP_IPD_PRC_HOLD_FIFO_CENA, 0,
+			   OPIP_IPD_PRC_HOLD_FIFO_PTR, OPIP_POOL_PACKET,
+			   opip_ipd_prc_hold_raddr);
+	opip_ipd_free_fifo(OPIP_IPD_PWP_PTR_FIFO_CTL,
+			   FIELD_GET(OPIP_IPD_PTR_COUNT_PKT_PCNT, count),
+			   OPIP_IPD_PWP_FIFO_RADDR, OPIP_IPD_PWP_FIFO_CENA,
+			   0, OPIP_IPD_PWP_FIFO_PTR, OPIP_POOL_PACKET,
+			   opip_ipd_pwp_pkt_raddr);
+
+	opip_ipd_reset();
 }
 
 /**
