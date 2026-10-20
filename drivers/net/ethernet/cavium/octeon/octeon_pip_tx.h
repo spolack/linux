@@ -19,6 +19,8 @@ DECLARE_STATIC_KEY_FALSE(opip_gmx401);
 netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev);
 int opip_xdp_tx(struct net_device *dev, struct opip_tx_poll *poll, u64 buf,
 		unsigned int len);
+int opip_xdp_tx_list(struct net_device *dev, struct opip_tx_poll *poll,
+		     u64 *list, unsigned int segs, unsigned int len);
 int opip_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 		  u32 flags);
 void opip_tx_poll_begin(struct opip_tx_poll *poll, int budget);

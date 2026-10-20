@@ -604,10 +604,23 @@ static void opip_set_hw_mtu(struct net_device *dev, int new_mtu)
 	}
 }
 
-/* The largest MTU for an XDP program: a packet in one buffer */
+/*
+ * The largest MTU for an XDP program: a packet in one buffer, or for a
+ * program that handles multi-buffer packets one that every verdict can
+ * take: the first buffer after its skip and the later ones whole, as
+ * many as XDP_TX's gather list holds (16 buffers, 32362 bytes) and an
+ * xdp_buff has frags for
+ */
 static unsigned int opip_xdp_max_mtu(const struct bpf_prog *prog)
 {
-	return OPIP_XDP_MAX_MTU;
+	unsigned int buf = OPIP_POOL_PACKET_SIZE - OPIP_BUF_LINK_SIZE;
+	unsigned int later = min_t(unsigned int, MAX_SKB_FRAGS,
+				   OPIP_TX_MAX_SEGS - 1);
+
+	if (!prog->aux->xdp_has_frags)
+		return OPIP_XDP_MAX_MTU;
+	return min(OPIP_XDP_MAX_MTU + later * buf,
+		   OPIP_MAX_FRAME - OPIP_MTU_OVERHEAD);
 }
 
 static int opip_change_mtu(struct net_device *dev, int new_mtu)
@@ -635,9 +648,15 @@ static int opip_xdp_setup(struct net_device *dev, struct netdev_bpf *bpf)
 	if (bpf->prog && dev->mtu > opip_xdp_max_mtu(bpf->prog)) {
 		unsigned int max = opip_xdp_max_mtu(bpf->prog);
 
-		NL_SET_ERR_MSG_FMT_MOD(bpf->extack,
-				       "MTU %u too large for XDP without multi-buffer support, %u at most",
-				       dev->mtu, max);
+		if (bpf->prog->aux->xdp_has_frags)
+			NL_SET_ERR_MSG_FMT_MOD(bpf->extack,
+					       "MTU %u too large for XDP, %u at most (XDP_TX: %zu buffers)",
+					       dev->mtu, max,
+					       OPIP_TX_MAX_SEGS);
+		else
+			NL_SET_ERR_MSG_FMT_MOD(bpf->extack,
+					       "MTU %u too large for single-buffer XDP, %u at most",
+					       dev->mtu, max);
 		return -EOPNOTSUPP;
 	}
 	old = rtnl_dereference(p->xdp_prog);
@@ -685,8 +704,10 @@ static int opip_xdp_rxq_register(struct net_device *dev)
 
 		if (!(opip->groups_mask & BIT(i)))
 			continue;
-		ret = xdp_rxq_info_reg(&p->xdp_rxq[i], dev, i,
-				       group->napi.napi_id);
+		/* bpf_xdp_adjust_tail() may grow a frag to its whole buffer */
+		ret = __xdp_rxq_info_reg(&p->xdp_rxq[i], dev, i,
+					 group->napi.napi_id,
+					 OPIP_RX_FRAG_SIZE);
 		if (!ret)
 			ret = xdp_rxq_info_reg_mem_model(&p->xdp_rxq[i],
 							 MEM_TYPE_PAGE_POOL,
@@ -1220,7 +1241,8 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	dev->hw_enc_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 	xdp_set_features_flag(dev, NETDEV_XDP_ACT_BASIC |
 			      NETDEV_XDP_ACT_REDIRECT |
-			      NETDEV_XDP_ACT_NDO_XMIT);
+			      NETDEV_XDP_ACT_NDO_XMIT |
+			      NETDEV_XDP_ACT_RX_SG);
 
 	/*
 	 * opip_probe() has waited for the nvmem cells: a failure here is final

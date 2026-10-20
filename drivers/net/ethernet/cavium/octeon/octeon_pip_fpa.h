@@ -35,6 +35,16 @@ static_assert(SKB_DATA_ALIGN(OPIP_POOL_PACKET_SIZE) +
 	      OPIP_RX_FRAG_SIZE);
 static_assert(IS_ALIGNED(OPIP_RX_FRAG_SIZE, 128));
 
+/*
+ * The offset in its page of an address in the packet buffer at @start: a
+ * whole page starts at its page, a slice need not
+ */
+static inline unsigned int opip_rx_page_offset(const void *start,
+					       const void *addr)
+{
+	return OPIP_RX_SPLIT ? offset_in_page(addr) : addr - start;
+}
+
 void opip_fpa_enable(void);
 unsigned int opip_fpa_level(int pool);
 unsigned int opip_fpa_fill(struct opip *opip, int pool, unsigned int size,

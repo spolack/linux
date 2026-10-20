@@ -94,9 +94,11 @@
 
 /*
  * A packet in the ring is an skb, an skb with a gather list (bit 1, the
- * list's address is in skb->cb), an XDP frame (bit 0), or nothing but
- * bit 0: a buffer the PKO frees to the packet pool itself, see
- * opip_xdp_tx().
+ * list's address is in skb->cb), an XDP frame (bit 0), nothing but bit 0:
+ * a buffer the PKO frees to the packet pool itself, see opip_xdp_tx(), or
+ * the gather list of such buffers (both bits, see opip_xdp_tx_list()). The
+ * last one decodes as an XDP frame too: the skb's tests come first and
+ * stay as they were, a frame's tell the list apart with bit 1.
  */
 #define OPIP_TX_XDP		1UL
 #define OPIP_TX_GATHER		2UL
@@ -112,6 +114,17 @@ static struct xdp_frame *opip_tx_entry_xdpf(unsigned long entry)
 {
 	return entry & OPIP_TX_XDP ?
 	       (struct xdp_frame *)(entry & ~OPIP_TX_FLAGS) : NULL;
+}
+
+/* Free the gather list of an XDP_TX packet, see opip_xdp_tx_list() */
+static void opip_tx_free_xdp_list(unsigned long entry, bool sync)
+{
+	void *list = (void *)(entry & ~OPIP_TX_FLAGS);
+
+	if (sync)
+		opip_fpa_free(list, OPIP_POOL_WQE, 0);
+	else
+		opip_fpa_free_nosync(list, OPIP_POOL_WQE, 0);
 }
 
 /* The gather list of a fragmented skb sits in a buffer from the WQE pool */
@@ -274,6 +287,11 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 			skbs++;
 			napi_consume_skb(skb, budget);
 		} else if (xdpf) {
+			/* An XDP_TX list: the PKO freed the buffers, not it */
+			if (unlikely(entry & OPIP_TX_GATHER)) {
+				opip_tx_free_xdp_list(entry, false);
+				continue;
+			}
 			bytes += xdpf->len;
 			xdp_return_frame_bulk(xdpf, &bq);
 		}
@@ -459,7 +477,7 @@ void opip_txq_free(struct opip_txq *q)
  * Only for the teardown: while the PKO runs, its engine may hold a packet
  * of the queue that no count shows, see opip_tx_timeout(). The buffers of
  * an XDP_TX packet are not freed: only the PKO frees them (its entry has
- * no address).
+ * no address, or that of their gather list, which is freed).
  *
  * Return: how many packets were freed
  */
@@ -480,6 +498,8 @@ unsigned int opip_txq_purge(struct opip_txq *q)
 					      OPIP_POOL_WQE, 0);
 			skbs++;
 			dev_kfree_skb_any(skb);
+		} else if (entry & OPIP_TX_GATHER) {
+			opip_tx_free_xdp_list(entry, true);
 		} else if (xdpf) {
 			xdp_return_frame(xdpf);
 		}
@@ -867,13 +887,14 @@ drop:
 }
 
 /*
- * The XDP_TX send of a packet in one buffer, @buf. Always inline: per
- * packet in the receive poll.
+ * The XDP_TX send: @buf names the packet's buffer, or with @segs its
+ * gather list (@entry its address). Always inline: per packet in the
+ * receive poll, and the one buffer case without the list's tests.
  */
 static __always_inline int __opip_xdp_tx(struct net_device *dev,
 					 struct opip_tx_poll *poll,
 					 unsigned long entry, u64 buf,
-					 unsigned int len)
+					 unsigned int len, unsigned int segs)
 {
 	struct opip_port *p = opip_port(dev);
 	struct netdev_queue *txq;
@@ -887,9 +908,11 @@ static __always_inline int __opip_xdp_tx(struct net_device *dev,
 	q = &p->txq[qid];
 	txq = netdev_get_tx_queue(dev, qid);
 
-	/* Errata GMX-401 */
+	/* Errata GMX-401: a runt over several buffers is not padded */
 	if (static_branch_unlikely(&opip_gmx401) &&
 	    unlikely(len < 64 && READ_ONCE(p->pad_runts))) {
+		if (segs)
+			return -ENOBUFS;
 		buf = opip_xdp_tx_pad_gmx401(buf, len);
 		if (!buf)
 			return -ENOBUFS;
@@ -900,6 +923,9 @@ static __always_inline int __opip_xdp_tx(struct net_device *dev,
 	if (q->written >= OPIP_TX_COMPLETE_BATCH)
 		opip_tx_complete(dev, qid, q, poll->budget);
 	cmd = opip_pko_cmd(q, len, true);
+	if (segs)
+		cmd = u64_replace_bits(cmd, segs, OPIP_PKO_CMD_SEGS) |
+		      OPIP_PKO_CMD_GATHER;
 	ok = opip_txq_free_slots(q) >= 2 &&
 	     opip_tx_write(dev, q, qid, entry, 0, cmd, buf);
 	if (ok) {
@@ -933,7 +959,34 @@ static __always_inline int __opip_xdp_tx(struct net_device *dev,
 int opip_xdp_tx(struct net_device *dev, struct opip_tx_poll *poll, u64 buf,
 		unsigned int len)
 {
-	return __opip_xdp_tx(dev, poll, OPIP_TX_XDP, buf, len);
+	return __opip_xdp_tx(dev, poll, OPIP_TX_XDP, buf, len, 0);
+}
+
+/**
+ * opip_xdp_tx_list - send received buffers back out, for XDP_TX
+ * @dev:  The port the packet came in on
+ * @poll: The list of the receive poll, which runs this
+ * @list: The gather list: a buffer pointer per segment, as for
+ *        opip_xdp_tx(), in a buffer of the WQE pool
+ * @segs: Entries in @list, at most %OPIP_TX_MAX_SEGS
+ * @len:  Packet length, the sum of the segments
+ *
+ * The XDP_TX of a packet over several buffers. The PKO frees the
+ * segments to the packet pool, as for one buffer; the list's pointer has
+ * the I bit set, so that it never frees the list, which the completion
+ * returns to the WQE pool.
+ *
+ * Return: 0, or -ENOBUFS when the caller has to free the buffers and the
+ * list (no room in the ring, or a CN3XXX half duplex runt)
+ */
+int opip_xdp_tx_list(struct net_device *dev, struct opip_tx_poll *poll,
+		     u64 *list, unsigned int segs, unsigned int len)
+{
+	return __opip_xdp_tx(dev, poll,
+			     (unsigned long)list | OPIP_TX_XDP | OPIP_TX_GATHER,
+			     opip_buf_build(opip_phys(list), segs,
+					    OPIP_POOL_WQE, 0, true),
+			     len, segs);
 }
 
 /**
@@ -1144,7 +1197,8 @@ static unsigned int opip_tx_complete_dev(struct net_device *dev)
  * queue, with interrupts off, which the pool's return does not allow,
  * comes off the ring onto the queue's list for the NAPI (a panic never
  * frees it, which is fine). The completion stops at an XDP frame, whose
- * return needs bottom halves on as well.
+ * return needs bottom halves on as well (and at the gather list of an
+ * XDP_TX packet, left to the next completion like the frame).
  */
 void opip_tx_netpoll(struct net_device *dev)
 {

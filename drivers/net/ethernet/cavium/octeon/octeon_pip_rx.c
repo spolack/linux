@@ -17,6 +17,7 @@
 #include <linux/netdevice.h>
 #include <linux/platform_device.h>
 #include <linux/prefetch.h>
+#include <linux/skbuff_ref.h>
 #include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/workqueue.h>
@@ -235,6 +236,89 @@ static void opip_rx_copy_segments(struct opip_wqe *wqe, struct sk_buff *skb)
 }
 
 /*
+ * The packet pool buffer of a frag of a packet over several buffers: a
+ * whole page, or the slice the frag is in (a program may have moved the
+ * frag's start, bpf_xdp_pull_data())
+ */
+static void *opip_rx_frag_buffer(const skb_frag_t *frag)
+{
+	unsigned int off = skb_frag_off(frag);
+
+	return page_address(skb_frag_page(frag)) +
+	       (OPIP_RX_SPLIT ? off - off % OPIP_RX_SLICE_SIZE : 0);
+}
+
+/*
+ * Give the frags of a packet back to the hardware, as an XDP program left
+ * them: what it took off the tail went back to the page pool already.
+ * Before the first buffer's free: its shared info lists them, and the
+ * hardware may fill that buffer again as soon as it has it.
+ */
+static void opip_rx_xdp_free_frags(const struct xdp_buff *xdp)
+{
+	const struct skb_shared_info *sinfo =
+		xdp_get_shared_info_from_buff(xdp);
+	unsigned int i;
+
+	/* What the program wrote into the frags out before the FPA has them */
+	wmb();
+	for (i = 0; i < sinfo->nr_frags; i++)
+		opip_fpa_free_nosync(opip_rx_frag_buffer(&sinfo->frags[i]),
+				     OPIP_POOL_PACKET,
+				     OPIP_POOL_PACKET_SIZE / 128);
+}
+
+/* A segment's PKO buffer pointer, 0 if BACK cannot name its buffer */
+static u64 opip_rx_xdp_tx_seg(const void *buffer, const void *data,
+			      unsigned int size)
+{
+	u64 addr = opip_xkphys_to_phys(data);
+	unsigned int back = (addr >> 7) - (opip_xkphys_to_phys(buffer) >> 7);
+
+	if (back > FIELD_MAX(OPIP_BUF_BACK) || !size)
+		return 0;
+	return opip_buf_build(addr, size, OPIP_POOL_PACKET, back, false);
+}
+
+/*
+ * XDP_TX of a packet over several buffers: the gather list goes into the
+ * packet's work entry, which the completion frees with it. A segment
+ * needs a BACK of four bits like a single buffer (a CN3XXX limit of the
+ * pointer, the later chips have the same field) and a size; the list
+ * holds OPIP_TX_MAX_SEGS of them. Out of line: the jumbo frames only.
+ *
+ * Return: 0, or an error: the caller frees the buffers and the entry
+ */
+static noinline int opip_rx_xdp_tx_frags(struct opip_group *group,
+					 struct net_device *dev,
+					 struct opip_wqe *wqe,
+					 const struct xdp_buff *xdp)
+{
+	const struct skb_shared_info *sinfo =
+		xdp_get_shared_info_from_buff(xdp);
+	unsigned int segs = sinfo->nr_frags + 1, i;
+	u64 *list = (u64 *)wqe;
+
+	if (segs > OPIP_TX_MAX_SEGS)
+		return -E2BIG;
+	list[0] = opip_rx_xdp_tx_seg(xdp->data_hard_start, xdp->data,
+				     xdp->data_end - xdp->data);
+	if (!list[0])
+		return -EINVAL;
+	for (i = 1; i < segs; i++) {
+		const skb_frag_t *frag = &sinfo->frags[i - 1];
+
+		list[i] = opip_rx_xdp_tx_seg(opip_rx_frag_buffer(frag),
+					     skb_frag_address(frag),
+					     skb_frag_size(frag));
+		if (!list[i])
+			return -EINVAL;
+	}
+	return opip_xdp_tx_list(dev, &group->tx_poll, list, segs,
+				xdp_get_buff_len(xdp));
+}
+
+/*
  * XDP_TX of a packet in one buffer, as the program left it. BACK has four
  * bits: data moved 2048 bytes or more into a whole page cannot name its
  * buffer (a slice ends before that). Always inline: per packet.
@@ -257,12 +341,16 @@ static __always_inline int opip_rx_xdp_tx_one(struct opip_group *group,
 }
 
 /*
- * Run the XDP program of the port on a packet in one buffer, as @xdp has
- * it: the caller prepared it, the whole buffer at @buffer. For XDP_TX the
- * buffer stays the hardware's, for a drop it goes back to the hardware,
- * for XDP_REDIRECT it becomes the frame's and the pool is refilled for it;
- * for XDP_PASS the caller builds the skb from @xdp. Always inline: per
- * packet.
+ * Run the XDP program of the port on a packet, as @xdp has it: the
+ * caller prepared it, the whole first buffer at @buffer and with @chain
+ * the frags of a packet over @segments buffers. For XDP_TX the buffers
+ * stay the hardware's, for a drop they go back to the hardware, for
+ * XDP_REDIRECT they become the frame's and the pool is refilled for them;
+ * for XDP_PASS the caller builds the skb from @xdp. What the program
+ * took off a chain's tail went back to the page pool: refilled too. The
+ * hardware's chain is not walked again, the program may have changed
+ * the link words in the headroom. Always inline: two callers, the
+ * single buffer one per packet and without the chain's tests.
  *
  * Return: the verdict
  */
@@ -270,27 +358,45 @@ static __always_inline u32 opip_rx_xdp(struct opip_group *group,
 				       struct net_device *dev,
 				       struct bpf_prog *prog,
 				       struct opip_wqe *wqe, void *buffer,
-				       struct xdp_buff *xdp)
+				       struct xdp_buff *xdp, const bool chain,
+				       unsigned int segments)
 {
+	unsigned int frags = 0;
 	u32 act;
 
 	act = bpf_prog_run_xdp(prog, xdp);
 	switch (act) {
 	case XDP_PASS:
 		return act;
-	case XDP_TX:
-		if (opip_rx_xdp_tx_one(group, dev, buffer, xdp)) {
+	case XDP_TX: {
+		int err;
+
+		/* Before the PKO has the buffers: the count is in the first */
+		if (chain && xdp_buff_has_frags(xdp)) {
+			frags = xdp_get_shared_info_from_buff(xdp)->nr_frags;
+			err = opip_rx_xdp_tx_frags(group, dev, wqe, xdp);
+		} else {
+			err = opip_rx_xdp_tx_one(group, dev, buffer, xdp);
+		}
+		if (err) {
 			trace_xdp_exception(dev, prog, act);
 			dev_core_stats_tx_dropped_inc(dev);
 			goto free;
 		}
+		if (chain)
+			WRITE_ONCE(group->to_refill,
+				   group->to_refill + segments - 1 - frags);
+		/* The entry of a packet over several buffers is its list */
+		if (frags)
+			return act;
 		break;
+	}
 	case XDP_REDIRECT:
 		if (xdp_do_redirect(dev, xdp, prog)) {
 			trace_xdp_exception(dev, prog, act);
 			goto free;
 		}
-		WRITE_ONCE(group->to_refill, group->to_refill + 1);
+		WRITE_ONCE(group->to_refill, group->to_refill + segments);
 		break;
 	default:
 		bpf_warn_invalid_xdp_action(dev, prog, act);
@@ -300,6 +406,15 @@ static __always_inline u32 opip_rx_xdp(struct opip_group *group,
 		fallthrough;
 	case XDP_DROP:
 free:
+		if (chain) {
+			if (xdp_buff_has_frags(xdp)) {
+				frags = xdp_get_shared_info_from_buff(xdp)->
+					nr_frags;
+				opip_rx_xdp_free_frags(xdp);
+			}
+			WRITE_ONCE(group->to_refill,
+				   group->to_refill + segments - 1 - frags);
+		}
 		opip_fpa_free(buffer, OPIP_POOL_PACKET,
 			      OPIP_POOL_PACKET_SIZE / 128);
 		act = XDP_DROP;
@@ -315,18 +430,30 @@ free:
  * (the packet pool mixes them) and goes back to that pool with its last
  * skb: into its cache when freed in its own group's poll, else its ring.
  * The skb comes from the packet's xdp_buff, as an XDP program left it:
- * the head and the metadata where it moved them, the buffer the same.
- * Not xdp_build_skb_from_buff(): a call per packet, the receive queue and
+ * the head and the metadata where it moved them, the buffer the same;
+ * with @chain the frags of a packet over several buffers too
+ * (opip_rx_prepare_chain()), whose descriptors sit in the
+ * skb_shared_info of the first buffer already. Not
+ * xdp_build_skb_from_buff(): a call per packet, the receive queue and
  * the protocol are opip_rx_deliver()'s, and the frame size and the page
  * pool are constants here. Always inline: with two callers gcc calls it
  * out of line, per packet.
  */
 static __always_inline struct sk_buff *
-opip_rx_build_xdp_skb(const struct xdp_buff *xdp)
+opip_rx_build_xdp_skb(const struct xdp_buff *xdp, const bool chain)
 {
+	unsigned int nr_frags = 0, frags_size = 0;
 	struct sk_buff *skb;
 	int meta;
 
+	/* The build clears the counts of the skb_shared_info */
+	if (chain && xdp_buff_has_frags(xdp)) {
+		const struct skb_shared_info *sinfo;
+
+		sinfo = xdp_get_shared_info_from_buff(xdp);
+		nr_frags = sinfo->nr_frags;
+		frags_size = sinfo->xdp_frags_size;
+	}
 	skb = napi_build_skb(xdp->data_hard_start, OPIP_RX_FRAG_SIZE);
 	if (unlikely(!skb))
 		return NULL;
@@ -336,10 +463,50 @@ opip_rx_build_xdp_skb(const struct xdp_buff *xdp)
 	meta = xdp->data - xdp->data_meta;
 	if (meta > 0)
 		skb_metadata_set(skb, meta);
+	/* Each frag is a whole buffer, however much a program took off it */
+	if (chain && nr_frags)
+		xdp_update_skb_frags_info(skb, nr_frags, frags_size,
+					  nr_frags * OPIP_RX_FRAG_SIZE,
+					  xdp_buff_get_skb_flags(xdp));
 	return skb;
 }
 
-/* A packet the PIP left in the entry, or one over several buffers */
+/*
+ * A packet over several buffers as an xdp_buff: the first buffer its
+ * linear part, the others its frags, page_pool buffers too: no high
+ * order allocation for a jumbo frame. The caller checked that the frags
+ * fit and initialized @xdp. Two buffers of a chain never coalesce into
+ * one frag: the data of a later buffer starts behind its link word,
+ * after the end of the buffer before it.
+ */
+static void opip_rx_prepare_chain(struct xdp_buff *xdp,
+				  const struct opip_wqe *wqe,
+				  unsigned int segments)
+{
+	unsigned int len = opip_wqe_len(wqe), size;
+	u64 seg = wqe->packet_ptr;
+	void *start, *data;
+
+	start = opip_virt(opip_buf_start(seg));
+	data = opip_virt(opip_buf_addr(seg));
+	/* Errata PKI-100, see opip_rx_copy_segments() */
+	size = min_t(unsigned int, len, OPIP_POOL_PACKET_SIZE - (data - start));
+	xdp_prepare_buff(xdp, start, data - start, size, true);
+
+	while (--segments) {
+		len -= size;
+		seg = opip_buf_next(seg);
+		start = opip_virt(opip_buf_start(seg));
+		data = opip_virt(opip_buf_addr(seg));
+		size = min_t(unsigned int, len,
+			     OPIP_POOL_PACKET_SIZE - (data - start));
+		xdp_buff_add_frag(xdp, page_to_netmem(virt_to_page(start)),
+				  opip_rx_page_offset(start, data), size,
+				  OPIP_RX_FRAG_SIZE);
+	}
+}
+
+/* A packet the PIP left in the entry, or over more buffers than frags */
 static struct sk_buff *opip_rx_copy_skb(struct opip_group *group,
 					struct opip_wqe *wqe)
 {
@@ -403,28 +570,69 @@ static __always_inline void opip_rx_deliver(struct opip_group *group,
 }
 
 /*
- * A packet not in one buffer, or in the entry alone: it is copied. An XDP
- * program sees the packets in one buffer only, the others do not pass
- * it. Returns false: nothing is redirected.
+ * A packet not in one buffer: its buffers become an xdp_buff with frags,
+ * which a program for multi-buffer packets sees, and an skb from that, or
+ * it is copied. Returns true if the program redirected the packet.
  */
 static noinline bool opip_rx_slow_packet(struct opip_group *group,
 					 struct opip_wqe *wqe,
 					 struct net_device *dev)
 {
 	struct bpf_prog *prog = rcu_dereference_bh(opip_port(dev)->xdp_prog);
+	unsigned int segments = opip_wqe_bufs(wqe);
+	bool csum_valid = true;
+	struct xdp_buff xdp;
 	struct sk_buff *skb;
 
 	/* A packet the program cannot see does not pass it */
-	if (unlikely(prog)) {
+	if (unlikely(prog && (!segments || segments > MAX_SKB_FRAGS + 1 ||
+			      !prog->aux->xdp_has_frags))) {
 		dev_core_stats_rx_dropped_inc(dev);
 		opip_rx_free_work(wqe);
 		return false;
 	}
 
-	skb = opip_rx_copy_skb(group, wqe);
-	if (skb)
-		opip_rx_deliver(group, dev, wqe, skb, true);
-	opip_rx_free_work(wqe);
+	if (!segments || segments > MAX_SKB_FRAGS + 1) {
+		skb = opip_rx_copy_skb(group, wqe);
+		if (skb)
+			opip_rx_deliver(group, dev, wqe, skb, true);
+		opip_rx_free_work(wqe);
+		return false;
+	}
+
+	xdp_init_buff(&xdp, OPIP_RX_FRAG_SIZE,
+		      &opip_port(dev)->xdp_rxq[group->group]);
+	opip_rx_prepare_chain(&xdp, wqe, segments);
+	if (prog) {
+		unsigned int len = opip_wqe_len(wqe);
+		void *data = xdp.data;
+		u32 act;
+
+		act = opip_rx_xdp(group, dev, prog, wqe, xdp.data_hard_start,
+				  &xdp, true, segments);
+		if (act != XDP_PASS)
+			return act == XDP_REDIRECT;
+		csum_valid = xdp.data == data && xdp_get_buff_len(&xdp) == len;
+	}
+
+	skb = opip_rx_build_xdp_skb(&xdp, true);
+	if (!skb) {
+		/* As the program left it: not along the hardware's chain */
+		if (xdp_buff_has_frags(&xdp)) {
+			segments -=
+				xdp_get_shared_info_from_buff(&xdp)->nr_frags;
+			opip_rx_xdp_free_frags(&xdp);
+		}
+		opip_fpa_free(xdp.data_hard_start, OPIP_POOL_PACKET,
+			      OPIP_POOL_PACKET_SIZE / 128);
+		WRITE_ONCE(group->to_refill, group->to_refill + segments - 1);
+		opip_fpa_free_nosync(wqe, OPIP_POOL_WQE, 1);
+		return false;
+	}
+	opip_rx_deliver(group, dev, wqe, skb, csum_valid);
+	/* The buffers are the skb's, replaced later */
+	WRITE_ONCE(group->to_refill, group->to_refill + segments);
+	opip_fpa_free_nosync(wqe, OPIP_POOL_WQE, 1);
 	return false;
 }
 
@@ -497,13 +705,14 @@ static __always_inline bool opip_rx_packet(struct opip_group *group,
 
 			/* The port's queue of the group */
 			xdp.rxq = &opip_port(dev)->xdp_rxq[group->group];
-			act = opip_rx_xdp(group, dev, prog, wqe, buffer, &xdp);
+			act = opip_rx_xdp(group, dev, prog, wqe, buffer, &xdp,
+					  false, 1);
 			if (act != XDP_PASS)
 				return act == XDP_REDIRECT;
 			csum_valid = xdp.data == data &&
 				     xdp.data_end == data + len;
 		}
-		skb = opip_rx_build_xdp_skb(&xdp);
+		skb = opip_rx_build_xdp_skb(&xdp, false);
 	} else {
 		return opip_rx_slow_packet(group, wqe, dev);
 	}
