@@ -90,9 +90,13 @@ struct platform_device;
 /*
  * A transmit queue: one PKO output queue of a port, with the chunk of
  * command words the driver writes for it. Everything that touches it runs
- * under the netdev queue lock: xmit and its transmit NAPI. The PKO counts
- * the packets it has sent in the queue's FAU register; the completion
- * compares the count with the ring and frees from the head.
+ * under the netdev queue lock: xmit, the end and the ticks of a receive
+ * poll that sent on it, its transmit NAPI, netpoll (a trylock), the
+ * watchdog, and the netpoll list's flush at a close; only the teardown
+ * after the PKO reset (opip_txq_purge()) runs without, with nothing else
+ * left on the queue. The PKO counts the packets it has sent in the
+ * queue's FAU register; the completion compares the count with the ring
+ * and frees from the head.
  */
 struct opip_txq {
 	/* The command chunk being written, and the words used in it */
@@ -116,6 +120,13 @@ struct opip_txq {
 	 * NAPI was scheduled for it, see opip_tx_complete()
 	 */
 	unsigned int written;
+	/* On the list of a receive poll, see opip_tx_poll_end() */
+	bool poll_dirty;
+	/*
+	 * skbs in flight: the polls complete the queue between their builds
+	 * while there are any
+	 */
+	unsigned int skbs;
 	/*
 	 * Schedules the NAPI for what is left in flight when nothing else
 	 * completes it
@@ -129,6 +140,8 @@ struct opip_txq {
 	unsigned long no_chunk;
 	unsigned long stopped;
 	unsigned long ring[OPIP_TXQ_RING];
+	/* Page pool skbs netpoll completed with irqs off, for the NAPI */
+	struct sk_buff *netpoll_skbs;
 	/*
 	 * Completes the queue outside of the receive polls, so that every
 	 * completion runs in a NAPI poll, see opip_tx_napi_poll()
@@ -172,9 +185,23 @@ struct opip_port {
 #define OPIP_GROUP_IRQ_DISABLED	0
 
 /*
+ * The queues a receive poll sent on, and the budget the core gave the
+ * poll: what the poll completes goes into the per-CPU NAPI skb cache
+ * under it
+ */
+struct opip_tx_poll {
+	int budget;
+	unsigned int num;
+	struct {
+		struct net_device *dev;
+		unsigned int qid;
+	} dirty[8];
+};
+
+/*
  * A POW group: delivers received packets to one CPU. The groups sit next
  * to each other in struct opip: a line of their own each, so that one
- * group's poll writing its tail (to_refill) does not share a
+ * group's poll writing its tail (to_refill, tx_poll) does not share a
  * line with the next group's head, which that group's interrupt and the
  * kicks write (state, csd).
  */
@@ -198,6 +225,11 @@ struct opip_group {
 	struct page_pool *pp;
 	/* Buffers this group's poll took out of the pool and has to replace */
 	unsigned int to_refill;
+	/*
+	 * The queues the poll sent on: they follow the poll when NAPI
+	 * moves it to another CPU, see opip_tx_poll_end()
+	 */
+	struct opip_tx_poll tx_poll;
 } ____cacheline_aligned_in_smp;
 
 /* The packet I/O complex */
@@ -225,6 +257,10 @@ struct opip {
 	 * filters, statistics. Some wait, so it is a mutex.
 	 */
 	struct mutex hw_lock;
+	/*
+	 * PKO_REG_READ_IDX selects what PKO_MEM_DEBUG* and PKO_MEM_COUNT* read
+	 */
+	spinlock_t pko_idx_lock;
 	struct delayed_work refill_work;
 	/* The driver goes away: the periodic works stop */
 	bool stopping;

@@ -24,6 +24,7 @@
 #include "octeon_pip_ipd.h"
 #include "octeon_pip_pow.h"
 #include "octeon_pip_rx.h"
+#include "octeon_pip_tx.h"
 
 /*
  * Asynchronous work requests: the POW answers into the core's scratch
@@ -35,6 +36,9 @@
 #else
 #define OPIP_ASYNC_POW		false
 #endif
+
+/* Receives between two transmit completions in a poll, opip_tx_poll_tick() */
+#define OPIP_TX_POLL_TICK	16
 
 /* The refill worker's retry after an allocation failure of an idle poll */
 #define OPIP_REFILL_RETRY	msecs_to_jiffies(20)
@@ -363,6 +367,7 @@ static int opip_poll(struct opip_group *group, int budget)
 	}
 
 	old_mask = opip_pow_select_group(core, group->group);
+	opip_tx_poll_begin(&group->tx_poll, budget);
 	/*
 	 * The loop runs two work entries ahead of the stack: the one in
 	 * hand had its cache line fetched while the stack handled the one
@@ -428,6 +433,14 @@ static int opip_poll(struct opip_group *group, int budget)
 
 		opip_rx_packet(group, wqe, dev, port);
 
+		/*
+		 * Complete what the PKO has sent on the poll's queues now and
+		 * then, so the freed skbs refill the cache the builds draw
+		 * from, see opip_tx_poll_tick().
+		 */
+		if (!(rx_count & (OPIP_TX_POLL_TICK - 1)))
+			opip_tx_poll_tick(&group->tx_poll);
+
 		/* Its line is in by now: have the next packet's data follow */
 		if (next)
 			prefetch(opip_virt(opip_buf_addr(next->packet_ptr)));
@@ -437,6 +450,7 @@ static int opip_poll(struct opip_group *group, int budget)
 		opip_pow_group_ack(group->group);
 	if (bp_count)
 		opip_ipd_bp_sub(bp_port, bp_bufs);
+	opip_tx_poll_end(&group->tx_poll, idle);
 	opip_pow_restore_groups(core, old_mask);
 	if (OPIP_ASYNC_POW)
 		opip_scratch_wr(OPIP_POW_SCRATCH, old_scratch);

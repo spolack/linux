@@ -346,11 +346,15 @@ static const struct net_device_ops opip_netdev_ops = {
 	.ndo_open		= opip_ndo_open,
 	.ndo_stop		= opip_ndo_stop,
 	.ndo_start_xmit		= opip_xmit,
+	.ndo_tx_timeout		= opip_tx_timeout,
 	.ndo_features_check	= opip_features_check,
 	.ndo_set_rx_mode	= opip_set_rx_mode,
 	.ndo_set_mac_address	= opip_set_mac_address,
 	.ndo_eth_ioctl		= opip_ioctl,
 	.ndo_change_mtu		= opip_change_mtu,
+#ifdef CONFIG_NET_POLL_CONTROLLER
+	.ndo_poll_controller	= opip_tx_netpoll,
+#endif
 };
 
 /* ------------------------------------------------------------------ */
@@ -1344,6 +1348,7 @@ static int opip_probe(struct platform_device *pdev)
 		return ret;
 	opip->pdev = pdev;
 	mutex_init(&opip->hw_lock);
+	spin_lock_init(&opip->pko_idx_lock);
 	INIT_DELAYED_WORK(&opip->refill_work, opip_refill_worker);
 	platform_set_drvdata(pdev, opip);
 

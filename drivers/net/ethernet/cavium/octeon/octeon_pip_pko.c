@@ -397,6 +397,46 @@ void opip_pko_reset(void)
 }
 
 /**
+ * opip_pko_queue_pending - commands the PKO still holds for a queue
+ * @opip:  The complex
+ * @queue: PKO output queue
+ *
+ * The doorbell count drops as the PKO fetches words into the queue's
+ * storage, so the storage indexes are read as well, after it: a word
+ * fetched in between is counted twice, never missed. The command the
+ * port's engine has taken out of the storage is in neither.
+ *
+ * Return: the command words of the queue the PKO has yet to fetch plus
+ * those it has fetched and not executed, 0 if it is done with the queue
+ */
+unsigned int opip_pko_queue_pending(struct opip *opip, int queue)
+{
+	bool cn3xxx = opip_chip->cn3xxx;
+	unsigned int pending;
+	unsigned long flags;
+	u64 debug, qcb;
+
+	spin_lock_irqsave(&opip->pko_idx_lock, flags);
+	opip_wr(OPIP_PKO_REG_READ_IDX,
+		FIELD_PREP(OPIP_PKO_REG_READ_IDX_INDEX, queue));
+	debug = opip_rd(cn3xxx ? OPIP_PKO_MEM_DEBUG9 : OPIP_PKO_MEM_DEBUG8);
+	qcb = opip_rd(cn3xxx ? OPIP_PKO_MEM_DEBUG8 : OPIP_PKO_MEM_DEBUG7);
+	spin_unlock_irqrestore(&opip->pko_idx_lock, flags);
+	if (opip_chip->cn68xx) {
+		pending = FIELD_GET(OPIP_PKO_MEM_DEBUG_DOORBELL_CN68XX, debug);
+		pending += (FIELD_GET(OPIP_PKO_MEM_DEBUG_QCB_WIDX_68, qcb) -
+			    FIELD_GET(OPIP_PKO_MEM_DEBUG_QCB_RIDX_68, qcb)) &
+			   FIELD_MAX(OPIP_PKO_MEM_DEBUG_QCB_RIDX_68);
+	} else {
+		pending = FIELD_GET(OPIP_PKO_MEM_DEBUG_DOORBELL, debug);
+		pending += (FIELD_GET(OPIP_PKO_MEM_DEBUG_QCB_WIDX, qcb) -
+			    FIELD_GET(OPIP_PKO_MEM_DEBUG_QCB_RIDX, qcb)) &
+			   FIELD_MAX(OPIP_PKO_MEM_DEBUG_QCB_RIDX);
+	}
+	return pending;
+}
+
+/**
  * opip_pko_gmx_port_mode - tell the PKO how many ports a GMX interface has
  * @iface:     Interface, 0 or 1
  * @num_ports: Ports on it

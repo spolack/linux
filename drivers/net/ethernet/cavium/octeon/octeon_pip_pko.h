@@ -66,6 +66,7 @@ void opip_pko_queue_release(struct opip *opip, struct opip_txq *txq);
 void opip_pko_enable(void);
 void opip_pko_disable(void);
 void opip_pko_reset(void);
+unsigned int opip_pko_queue_pending(struct opip *opip, int queue);
 void opip_pko_gmx_port_mode(int iface, int num_ports);
 bool opip_pko_write_next(struct opip_txq *txq, u64 w0, u64 w1);
 

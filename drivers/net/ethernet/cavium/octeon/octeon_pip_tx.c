@@ -23,11 +23,18 @@
  * of a queue it has sent in the queue's FAU register (word 0: REG0 and
  * SUBONE0), and the completion reads the counter and frees that many
  * packets from the head of the queue's ring; the PKO sends a queue's
- * packets in the order of their commands. The counter is read in a NAPI
- * poll, under the budget the core gave it: every queue has a NAPI of its
- * own on the port, which a transmit schedules once in 8 packets, and so
- * does a timer per queue for whatever is left when nothing else comes
- * along. There is no completion interrupt: a packet that asks for one is
+ * packets in the order of their commands. The counter is read where the
+ * packets come from, and always in a NAPI poll, under the budget the core
+ * gave it: in a receive poll once in 16 received packets for the queues
+ * with skbs in flight, at its end for the queues it sent on, and in xmit
+ * from the poll for the queue it is about to use (once in 8 packets, not
+ * for every one). Every queue has a NAPI of its own on the port for the
+ * rest: a transmit outside of a receive poll schedules it once in 8
+ * packets, unless a poll has the queue on its list, and so does a timer
+ * per queue for whatever is left when nothing else comes along. That NAPI
+ * waits for the one its CPU is in (the RPS backlog, another driver's), so
+ * from half full on a transmit outside of a receive poll reads the counter
+ * itself. There is no completion interrupt: a packet that asks for one is
  * a three word command.
  */
 
@@ -42,6 +49,7 @@
 #include <linux/ktime.h>
 #include <linux/netdevice.h>
 #include <linux/netpoll.h>
+#include <linux/preempt.h>
 #include <linux/prefetch.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
@@ -57,8 +65,22 @@
 /* Free slots a stopped transmit queue needs before it is woken */
 #define OPIP_TX_WAKE_THRESH	(OPIP_TXQ_DEPTH / 4)
 
-/* Packets written between two reads of the counter by the transmit paths */
+/*
+ * Packets in flight from which a transmit outside of a receive poll
+ * completes the queue itself instead of scheduling its NAPI, which runs
+ * only once the NAPI its CPU is in returns, see opip_tx_batch()
+ */
+#define OPIP_TX_COMPLETE_THRESH	(OPIP_TXQ_DEPTH / 2)
+
+/*
+ * Packets written between two reads of the counter by the transmit paths.
+ * In a receive poll this interleaves the frees with the skb builds, so the
+ * per-CPU skb cache recycles them instead of overflowing to the slab.
+ */
 #define OPIP_TX_COMPLETE_BATCH	8
+
+/* Command words a receive poll writes before it rings the doorbell */
+#define OPIP_TX_POLL_DOORBELL	24
 
 /* The timer for what xmit and the polls leave in flight */
 #define OPIP_TX_TIMER_NS	(250 * NSEC_PER_USEC)
@@ -83,6 +105,9 @@ static u64 **opip_tx_skb_list(struct sk_buff *skb)
 
 /* The largest IP header offset IPOFFP1 (offset + 1, 7 bits) can name */
 #define OPIP_TX_MAX_IPOFF	(FIELD_MAX(OPIP_PKO_CMD_IPOFFP1) - 1)
+
+/* The list of the receive poll running on a CPU, NULL outside of one */
+static DEFINE_PER_CPU(struct opip_tx_poll *, opip_tx_poll_cur);
 
 /* Packets handed to the PKO whose completion is still due */
 static unsigned int opip_txq_inflight(struct opip_txq *q)
@@ -152,11 +177,23 @@ static void opip_tx_doorbell(struct opip_port *p, struct opip_txq *q)
  * what the PKO subtracted, so its negation is the number of packets ever
  * sent on the queue; the head counts the same way. The read is an I/O
  * round trip: the transmit paths do it once in OPIP_TX_COMPLETE_BATCH
- * packets.
+ * packets, the poll end once per poll.
  *
- * @budget is the budget the core passed to the queue's NAPI poll, which
- * this runs in: the skbs go into the per-CPU NAPI cache. A drain, from
- * process context, passes 0 and frees to the slab.
+ * @budget is the budget the core passed to the NAPI poll this runs in: a
+ * receive poll (its ticks, its end, what it transmits) or the queue's own
+ * NAPI, or any non-zero one for a transmit in a softirq outside of a
+ * receive poll. The skbs go into the per-CPU NAPI cache they were built
+ * from. A drain from process context, the watchdog and a transmit outside
+ * of a softirq pass 0 and free to the slab. netpoll transmits with
+ * interrupts off and bottom halves on, so it leaves the completion to the
+ * NAPI and to opip_tx_netpoll(). The stack delivers the last packets of
+ * every poll (its GRO batch) after the poll has returned, so a third of a
+ * forwarding load's packets are sent from outside the poll on the poll's
+ * CPU; freeing those to the slab starved the cache, and the next poll
+ * built its skbs cold from the slab. A transmit outside a receive poll
+ * leaves them to the next poll that has the queue on its list, or
+ * schedules the queue's NAPI, see opip_tx_kick(), until the ring is half
+ * full, see opip_tx_batch().
  *
  * Return: the number of packets completed
  */
@@ -165,7 +202,7 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 {
 	struct netdev_queue *txq = netdev_get_tx_queue(dev, qid);
 	unsigned int head = q->head, n, pkts;
-	unsigned int bytes = 0;
+	unsigned int bytes = 0, skbs = 0;
 	u32 sent;
 
 	sent = -opip_fau_rd32(q->fau);
@@ -195,9 +232,11 @@ static unsigned int opip_tx_complete(struct net_device *dev, unsigned int qid,
 				opip_fpa_free_nosync(*opip_tx_skb_list(skb),
 						     OPIP_POOL_WQE, 0);
 			bytes += skb->len;
+			skbs++;
 			napi_consume_skb(skb, budget);
 		}
 	}
+	WRITE_ONCE(q->skbs, q->skbs - skbs);
 	WRITE_ONCE(q->head, head);
 
 	netif_txq_completed_wake(txq, pkts, bytes, opip_txq_free_slots(q),
@@ -221,22 +260,66 @@ static __always_inline void opip_tx_arm(struct opip_txq *q)
 }
 
 /*
- * A transmit has written a batch: the queue's NAPI completes it, on this
- * CPU, once bottom halves are back on. Under the queue lock. The batch
- * starts over: with the NAPI still pending the next one has it polled
- * once more.
+ * A transmit outside of a receive poll has written a batch: the poll that
+ * has the queue on its list completes it soon (see opip_tx_poll_end()),
+ * otherwise the queue's NAPI does, on this CPU, once bottom halves are
+ * back on. Under the queue lock. The batch starts over: with the NAPI
+ * still pending the next one has it polled once more.
  */
 static void opip_tx_kick(struct opip_txq *q)
 {
 	q->written = 0;
-	napi_schedule(&q->napi);
+	if (!q->poll_dirty)
+		napi_schedule(&q->napi);
+}
+
+/*
+ * A transmit has written OPIP_TX_COMPLETE_BATCH packets: complete them in
+ * a receive poll, under the poll's budget. Outside of one the queue's NAPI
+ * does, but the RPS backlog's poll of 64 GRO super-skbs fills the ring
+ * several times over before the NAPI gets to run, and the PKO idles on a
+ * ring of sent packets meanwhile: from OPIP_TX_COMPLETE_THRESH on the
+ * transmit completes them itself, with a NAPI budget in a softirq, to the
+ * slab from process context. Below it the FAU read is not worth it. Under
+ * the queue lock, never for netpoll.
+ */
+static __always_inline void opip_tx_batch(struct net_device *dev,
+					  unsigned int qid, struct opip_txq *q,
+					  struct opip_tx_poll *poll)
+{
+	if (poll)
+		opip_tx_complete(dev, qid, q, poll->budget);
+	else if (opip_txq_inflight(q) >= OPIP_TX_COMPLETE_THRESH)
+		opip_tx_complete(dev, qid, q,
+				 in_serving_softirq() ? NAPI_POLL_WEIGHT : 0);
+	else
+		opip_tx_kick(q);
+}
+
+/*
+ * Free the page pool skbs opip_tx_netpoll() took off the ring with
+ * interrupts off. Under the queue lock, with interrupts on: the NAPI,
+ * or a purge.
+ */
+static void opip_tx_netpoll_flush(struct opip_txq *q)
+{
+	struct sk_buff *skb;
+
+	while ((skb = q->netpoll_skbs)) {
+		q->netpoll_skbs = skb->next;
+		skb->next = NULL;
+		dev_consume_skb_any(skb);
+	}
 }
 
 /*
  * The queue's NAPI: complete what the PKO has sent and leave the rest to
- * the timer, under the budget the core gave the poll. netpoll's budget
- * of 0 allows no page pool skb to be freed: the NAPI stays scheduled
- * for the next real poll.
+ * the timer. What it completes is mostly the tail of a receive poll on
+ * this CPU; freed to the slab, that made the next poll refill the per-CPU
+ * NAPI skb cache from the slab too, so it is a NAPI and frees under its
+ * budget. netpoll's budget of
+ * 0 allows no page pool skb to be freed: the NAPI stays scheduled for
+ * the next real poll, and opip_tx_netpoll() makes netpoll's room.
  */
 static int opip_tx_napi_poll(struct napi_struct *napi, int budget)
 {
@@ -247,6 +330,8 @@ static int opip_tx_napi_poll(struct napi_struct *napi, int budget)
 		return 0;
 
 	__netif_tx_lock(txq, smp_processor_id());
+	if (unlikely(q->netpoll_skbs))
+		opip_tx_netpoll_flush(q);
 	opip_tx_complete(q->dev, q->qid, q, budget);
 	/* A closed device's MAC sends nothing: opip_tx_resume() rearms */
 	if (netif_running(q->dev))
@@ -292,9 +377,20 @@ void opip_txq_init(struct net_device *dev, unsigned int qid)
  */
 void opip_txq_exit(struct opip_txq *q)
 {
+	struct netdev_queue *txq;
+
 	if (!q->dev)
 		return;
 	hrtimer_cancel(&q->timer);
+	/*
+	 * No timer any more: what netpoll left is freed here, under the
+	 * queue lock, as the queue's NAPI may still run (a close drains
+	 * before it disables the NAPIs)
+	 */
+	txq = netdev_get_tx_queue(q->dev, q->qid);
+	__netif_tx_lock_bh(txq);
+	opip_tx_netpoll_flush(q);
+	__netif_tx_unlock_bh(txq);
 }
 
 /**
@@ -317,13 +413,13 @@ void opip_txq_free(struct opip_txq *q)
  * @q: The queue, the PKO reset
  *
  * Only for the teardown: while the PKO runs, its engine may hold a packet
- * of the queue that no count shows.
+ * of the queue that no count shows, see opip_tx_timeout().
  *
  * Return: how many packets were freed
  */
 unsigned int opip_txq_purge(struct opip_txq *q)
 {
-	unsigned int head, freed = 0;
+	unsigned int head, freed = 0, skbs = 0;
 
 	for (head = q->head; head != q->tail; head++, freed++) {
 		unsigned long entry = q->ring[head & (OPIP_TXQ_RING - 1)];
@@ -333,10 +429,13 @@ unsigned int opip_txq_purge(struct opip_txq *q)
 			if (entry & OPIP_TX_GATHER)
 				opip_fpa_free(*opip_tx_skb_list(skb),
 					      OPIP_POOL_WQE, 0);
+			skbs++;
 			dev_kfree_skb_any(skb);
 		}
 	}
+	WRITE_ONCE(q->skbs, q->skbs - skbs);
 	WRITE_ONCE(q->head, head);
+	opip_tx_netpoll_flush(q);
 	return freed;
 }
 
@@ -522,6 +621,8 @@ static bool opip_tx_write(struct net_device *dev, struct opip_txq *q,
 	/* Once the hardware has it, the completion may run on another CPU */
 	q->ring[q->tail & (OPIP_TXQ_RING - 1)] = entry;
 	WRITE_ONCE(q->tail, q->tail + 1);
+	if (skb)
+		WRITE_ONCE(q->skbs, q->skbs + 1);
 	netdev_tx_sent_queue(netdev_get_tx_queue(dev, qid), len);
 	q->doorbell += 2;
 	q->written++;
@@ -536,6 +637,21 @@ static noinline __cold void opip_tx_drop(struct net_device *dev,
 	dev_kfree_skb_any(skb);
 }
 
+/* Have the receive poll of this CPU ring the doorbell of a queue */
+static bool opip_tx_poll_mark(struct opip_tx_poll *poll, struct opip_txq *q,
+			      struct net_device *dev, unsigned int qid)
+{
+	if (q->poll_dirty)
+		return true;
+	if (poll->num == ARRAY_SIZE(poll->dirty))
+		return false;
+	poll->dirty[poll->num].dev = dev;
+	poll->dirty[poll->num].qid = qid;
+	poll->num++;
+	q->poll_dirty = true;
+	return true;
+}
+
 /**
  * opip_xmit - transmit a packet
  * @skb: Packet to send
@@ -547,6 +663,7 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	unsigned int qid = skb_get_queue_mapping(skb);
 	struct opip_port *p = opip_port(dev);
+	struct opip_tx_poll *poll;
 	struct netdev_queue *txq;
 	struct opip_txq *q;
 	unsigned int len;
@@ -555,6 +672,17 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	txq = netdev_get_tx_queue(dev, qid);
 	q = &p->txq[qid];
+
+	/*
+	 * netpoll may send from an interrupt in the middle of this CPU's
+	 * receive poll: not onto the poll's list. A preempt count test, the
+	 * CP0 Status read of irqs_disabled() costs the forwarding rate;
+	 * without netpoll nothing sends from an interrupt. Bottom halves
+	 * are off (interrupts for netpoll): no preemption to guard the
+	 * per-CPU read against.
+	 */
+	poll = IS_ENABLED(CONFIG_NETPOLL) && (in_hardirq() || in_nmi()) ?
+	       NULL : __this_cpu_read(opip_tx_poll_cur);
 
 	/* The gather list must fit its buffer */
 	if (unlikely(skb_is_nonlinear(skb) &&
@@ -592,7 +720,7 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	/* The packets sent a batch ago are out: make room before adding */
 	if (q->written >= OPIP_TX_COMPLETE_BATCH && !netpoll_tx_running(dev))
-		opip_tx_kick(q);
+		opip_tx_batch(dev, qid, q, poll);
 
 	/*
 	 * Before the command is written: a completion may free the skb then.
@@ -612,6 +740,19 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 		opip_tx_drop(dev, skb);
 	opip_tx_maybe_stop(txq, q);
 
+	/*
+	 * From a receive poll the queue goes on the poll's list, whose end
+	 * completes it and arms the timer. The doorbell rings at the end of
+	 * the stack's batch as outside of a poll, or once the poll's words on
+	 * the queue reach OPIP_TX_POLL_DOORBELL or the queue stops.
+	 */
+	if (poll && opip_tx_poll_mark(poll, q, dev, qid)) {
+		if (!netdev_xmit_more() ||
+		    q->doorbell >= OPIP_TX_POLL_DOORBELL ||
+		    netif_xmit_stopped(txq))
+			opip_tx_doorbell(p, q);
+		return NETDEV_TX_OK;
+	}
 	if (!netdev_xmit_more() || netif_xmit_stopped(txq)) {
 		opip_tx_doorbell(p, q);
 		opip_tx_arm(q);
@@ -628,8 +769,106 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+/**
+ * opip_tx_poll_begin - the start of a receive poll's transmit side
+ * @poll:   The poll's list
+ * @budget: The budget the core passed to the poll, not 0
+ *
+ * A receive poll starts on this CPU: the queues it sends on go on its
+ * list, see opip_tx_poll_end(), and what it completes is freed under
+ * @budget.
+ */
+void opip_tx_poll_begin(struct opip_tx_poll *poll, int budget)
+{
+	poll->budget = budget;
+	this_cpu_write(opip_tx_poll_cur, poll);
+}
+
+/**
+ * opip_tx_poll_tick - complete in flight packets in the middle of a poll
+ * @poll: The poll's list
+ *
+ * Called every few received packets. The packets a receive poll forwards
+ * leave the PKO after the batch in xmit has looked for them, and the ones
+ * the stack sends after the poll has returned (the GRO tail, a tunnel's
+ * workers) leave while the next poll receives: nothing completed either
+ * before a poll's end, in one lump, after all of the poll's skb builds
+ * had drawn from the per-CPU NAPI skb cache, which the lump then pushed
+ * over its edge, so a part of every poll's skbs went through the slab and
+ * came back cold (the stateful IPv6 forwarding rate). Completing them
+ * here, spread over the builds, keeps the cache in the middle. A queue is
+ * read while it has skbs in flight. The queues are the ones the polls
+ * kept on the list, see opip_tx_poll_end().
+ */
+void opip_tx_poll_tick(struct opip_tx_poll *poll)
+{
+	unsigned int cpu = smp_processor_id();
+	unsigned int i;
+
+	for (i = 0; i < poll->num; i++) {
+		struct net_device *dev = poll->dirty[i].dev;
+		unsigned int qid = poll->dirty[i].qid;
+		struct netdev_queue *txq;
+		struct opip_txq *q;
+
+		q = &opip_port(dev)->txq[qid];
+		if (!READ_ONCE(q->skbs))
+			continue;
+		txq = netdev_get_tx_queue(dev, qid);
+		__netif_tx_lock(txq, cpu);
+		opip_tx_complete(dev, qid, q, poll->budget);
+		__netif_tx_unlock(txq);
+	}
+}
+
+/**
+ * opip_tx_poll_end - the end of a receive poll's transmit side
+ * @poll: The poll's list
+ * @idle: The poll found the group empty; otherwise it is polled again at once
+ *
+ * Ring the doorbells and complete the queues the poll sent on. A queue
+ * with packets still in flight stays on the group's list as long as the
+ * polls go on, so that the next poll's end completes it whether it sends
+ * on it or not; only when the poll goes idle, and the next one may be
+ * far, the queue's timer and NAPI take over. Under load that is one timer
+ * less per queue firing every 250 us; arming it only at idle without
+ * keeping the list left queues without completion for seconds.
+ */
+void opip_tx_poll_end(struct opip_tx_poll *poll, bool idle)
+{
+	unsigned int i, kept = 0;
+
+	this_cpu_write(opip_tx_poll_cur, NULL);
+	for (i = 0; i < poll->num; i++) {
+		struct net_device *dev = poll->dirty[i].dev;
+		unsigned int qid = poll->dirty[i].qid;
+		struct opip_port *p = opip_port(dev);
+		struct netdev_queue *txq;
+		struct opip_txq *q;
+		bool inflight;
+
+		txq = netdev_get_tx_queue(dev, qid);
+		q = &p->txq[qid];
+
+		__netif_tx_lock(txq, smp_processor_id());
+		opip_tx_doorbell(p, q);
+		opip_tx_complete(dev, qid, q, poll->budget);
+		opip_tx_maybe_stop(txq, q);
+		inflight = opip_txq_inflight(q);
+		if (idle || !inflight) {
+			q->poll_dirty = false;
+			if (inflight)
+				opip_tx_arm(q);
+		} else {
+			poll->dirty[kept++] = poll->dirty[i];
+		}
+		__netif_tx_unlock(txq);
+	}
+	poll->num = kept;
+}
+
 /* ------------------------------------------------------------------ */
-/* Drain */
+/* Drain and watchdog */
 
 /*
  * Complete what the PKO has sent on all queues of a device; returns what
@@ -652,6 +891,74 @@ static unsigned int opip_tx_complete_dev(struct net_device *dev)
 	}
 	return inflight;
 }
+
+#ifdef CONFIG_NET_POLL_CONTROLLER
+/**
+ * opip_tx_netpoll - complete the sent skbs of a device, for netpoll
+ * @dev: Port
+ *
+ * The ports' ndo_poll_controller: netpoll asks for this when a queue is
+ * stopped or busy. Room on the port's queues is what it needs; the
+ * receive polls are not scheduled from here (their NAPI instances hang
+ * off a dummy device, none could run before netpoll returns, and their
+ * interrupts schedule them afterwards; nor are the queues' NAPIs, which
+ * netpoll polls with a budget of 0). With interrupts off the timer cannot
+ * run, and in a panic nothing else does: without this every later message
+ * is lost. The skbs go to dev_consume_skb_any(), but a page pool skb (a
+ * forwarded one) that netpoll would free right away from its completion
+ * queue, with interrupts off, which the pool's return does not allow,
+ * comes off the ring onto the queue's list for the NAPI (a panic never
+ * frees it, which is fine).
+ */
+void opip_tx_netpoll(struct net_device *dev)
+{
+	struct opip_port *p = opip_port(dev);
+	unsigned int qid;
+
+	for (qid = 0; qid < dev->real_num_tx_queues; qid++) {
+		struct netdev_queue *txq = netdev_get_tx_queue(dev, qid);
+		unsigned int head, n, pkts = 0, bytes = 0, skbs = 0;
+		struct opip_txq *q = &p->txq[qid];
+
+		if (!__netif_tx_trylock(txq))
+			continue;
+		q->written = 0;
+		head = q->head;
+		n = min(-opip_fau_rd32(q->fau) - head, q->tail - head);
+		while (n--) {
+			unsigned long entry =
+				q->ring[head & (OPIP_TXQ_RING - 1)];
+			struct sk_buff *skb = opip_tx_entry_skb(entry);
+
+			if (skb) {
+				if (entry & OPIP_TX_GATHER)
+					opip_fpa_free(*opip_tx_skb_list(skb),
+						      OPIP_POOL_WQE, 0);
+				bytes += skb->len;
+				skbs++;
+				if (skb->pp_recycle) {
+					skb->next = q->netpoll_skbs;
+					q->netpoll_skbs = skb;
+				} else {
+					dev_consume_skb_any(skb);
+				}
+			}
+			head++;
+			pkts++;
+		}
+		WRITE_ONCE(q->skbs, q->skbs - skbs);
+		WRITE_ONCE(q->head, head);
+		netif_txq_completed_wake(txq, pkts, bytes,
+					 opip_txq_free_slots(q),
+					 OPIP_TX_WAKE_THRESH);
+		/* Nothing in flight arms the timer: the list needs it */
+		if (q->netpoll_skbs && !hrtimer_is_queued(&q->timer))
+			hrtimer_start(&q->timer, OPIP_TX_TIMER_NS,
+				      HRTIMER_MODE_REL_PINNED_SOFT);
+		__netif_tx_unlock(txq);
+	}
+}
+#endif
 
 /**
  * opip_tx_drain - wait for the packets in flight on a stopped device
@@ -719,4 +1026,65 @@ void opip_tx_stop(struct net_device *dev)
 
 	for (qid = 0; qid < dev->real_num_tx_queues; qid++)
 		napi_disable(&p->txq[qid].napi);
+}
+
+/**
+ * opip_tx_timeout - the stack's watchdog found a queue stopped too long
+ * @dev:     Device
+ * @txqueue: The transmit queue
+ *
+ * Diagnostics, no recovery. What the PKO has sent is completed first, so
+ * that a queue only short of a completion is woken and the rest is what
+ * the PKO really holds. A queue stays stopped while the PKO does not send
+ * its packets: a link partner that pauses the port, a MAC that does not
+ * send, or a PKO error, which stops the port for good. Nothing can be
+ * taken back from the PKO while it runs: with no command word of the
+ * queue left in its storage, the port's engine still holds the queue's
+ * newest packet, counted nowhere, and freeing it would leave the queue's
+ * FAU counter one ahead for good, a later completion freeing a packet the
+ * PKO has not sent. The queue waits for the PKO; its completions wake it.
+ * Runs in the watchdog's timer.
+ */
+void opip_tx_timeout(struct net_device *dev, unsigned int txqueue)
+{
+	struct netdev_queue *txq = netdev_get_tx_queue(dev, txqueue);
+	unsigned int inflight, pending, doorbell;
+	struct opip_port *p = opip_port(dev);
+	struct opip_txq *q;
+	u64 error;
+
+	q = &p->txq[txqueue];
+
+	__netif_tx_lock(txq, smp_processor_id());
+	opip_tx_complete(dev, txqueue, q, 0);
+	inflight = opip_txq_inflight(q);
+	/* Written, not announced yet: a receive poll on another CPU */
+	doorbell = q->doorbell;
+	__netif_tx_unlock(txq);
+	pending = opip_pko_queue_pending(p->opip, q->queue);
+
+	netdev_warn(dev, "transmit queue %u stopped: %u packets in flight, the PKO holds %u command words of queue %d\n",
+		    txqueue, inflight, pending, q->queue);
+	if (inflight && !pending && !doorbell)
+		net_warn_ratelimited("%s: transmit queue %u: the engine holds its last packet; waiting\n",
+				     netdev_name(dev), txqueue);
+
+	/*
+	 * A PKO error stops the port for good; name it. The bits are
+	 * write-one-to-clear, so each error is reported once.
+	 */
+	error = opip_rd(OPIP_PKO_REG_ERROR);
+	if (error) {
+		opip_wr(OPIP_PKO_REG_ERROR, error);
+		netdev_err(dev, "PKO error%s%s%s%s (PKO_REG_ERROR %#llx)\n",
+			   error & OPIP_PKO_REG_ERROR_PARITY ?
+			   " parity" : "",
+			   error & OPIP_PKO_REG_ERROR_DOORBELL ?
+			   " bad-doorbell" : "",
+			   error & OPIP_PKO_REG_ERROR_CURRZERO ?
+			   " zero-buffer-pointer" : "",
+			   error & OPIP_PKO_REG_ERROR_LOOPBACK ?
+			   " loopback" : "",
+			   (unsigned long long)error);
+	}
 }
