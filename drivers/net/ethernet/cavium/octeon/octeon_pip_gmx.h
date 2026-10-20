@@ -43,6 +43,8 @@ void opip_gmx_set_frame_max(int iface, int index, unsigned int max_frame);
 void opip_gmx_set_speed(int iface, int index, const struct opip_link *link,
 			bool rgmii);
 int opip_gmx_wait_idle(int iface, int index);
+void opip_gmx_set_pause(int iface, int index, bool rx);
+void opip_gmx_clear_bp_override(int iface, int index);
 void opip_gmx_bp_state(int iface, int num_ports, struct opip_gmx_bp *s);
 unsigned int opip_gmx_poll_errors(int iface, int index, bool nxa);
 void opip_gmx_stats_init(int iface, int index);

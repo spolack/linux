@@ -13,6 +13,7 @@ int opip_rx_init(struct opip *opip);
 void opip_rx_shutdown(struct opip *opip);
 void opip_rx_free_pools(struct opip *opip);
 void opip_rx_refill_check(struct opip *opip);
+int opip_rx_resize(struct opip *opip, unsigned int count);
 void opip_group_schedule(struct opip_group *group);
 void opip_rx_free_work(struct opip_wqe *wqe);
 

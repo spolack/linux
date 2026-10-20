@@ -42,6 +42,7 @@ unsigned int opip_fpa_fill(struct opip *opip, int pool, unsigned int size,
 void opip_fpa_empty(struct opip *opip, int pool, unsigned int count);
 unsigned int opip_fpa_fill_packet_pool(struct page_pool *pp,
 				       unsigned int count, gfp_t gfp);
+void *opip_fpa_alloc_packet_buf(struct page_pool *pp, gfp_t gfp);
 void opip_fpa_put_packet_buf(void *buf);
 void opip_fpa_empty_packet_pool(struct opip *opip, unsigned int count);
 

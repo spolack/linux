@@ -302,7 +302,9 @@ void opip_ipd_reset(void)
  * @drop: All packets are dropped below this many
  *
  * On all eight QoS queues, from the actual count rather than an average.
- * Backpressure by queued buffers is left off.
+ * Backpressure by queued buffers is left off: the driver asserts it per
+ * port through the page counts, see opip_ipd_bp_config(), and they are
+ * left alone here, a resize keeps them.
  */
 void opip_ipd_red_setup(unsigned int pass, unsigned int drop)
 {
@@ -347,6 +349,27 @@ void opip_ipd_fcs_strip(int port, bool strip)
 	else
 		return;
 	opip_wr(OPIP_IPD_SUB_PORT_FCS, strip ? reg | bit : reg & ~bit);
+}
+
+/**
+ * opip_ipd_bp_config - per-port backpressure on the buffers waiting
+ * @port:     IPD port
+ * @enable:   Assert backpressure at all
+ * @page_cnt: Threshold, in units of 256 buffers
+ *
+ * The IPD looks at the threshold again when the count changes, so the
+ * count is poked: backpressure that is asserted would stay so after it
+ * is disabled.
+ */
+void opip_ipd_bp_config(int port, bool enable, unsigned int page_cnt)
+{
+	opip_wr(OPIP_IPD_PORT_BP_PAGE_CNT(port),
+		(enable ? OPIP_IPD_PORT_BP_PAGE_CNT_BP_ENB : 0) |
+		FIELD_PREP(OPIP_IPD_PORT_BP_PAGE_CNT_PAGE_CNT,
+			   enable ? page_cnt :
+			   FIELD_MAX(OPIP_IPD_PORT_BP_PAGE_CNT_PAGE_CNT)));
+	opip_wr(OPIP_IPD_SUB_PORT_BP_PAGE_CNT,
+		FIELD_PREP(OPIP_IPD_SUB_PORT_BP_PAGE_CNT_PORT, port));
 }
 
 /**

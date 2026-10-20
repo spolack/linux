@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * The links of octeon_pip's ports: phylink's MAC operations and the
- * RGMII preamble workaround.
+ * The links of octeon_pip's ports: phylink's MAC operations,
+ * flow control, and the RGMII preamble workaround.
  */
 
 #include <linux/kernel.h>
+#include <linux/lockdep.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_mdio.h>
@@ -18,6 +19,54 @@
 #include "octeon_pip_gmx.h"
 #include "octeon_pip_ipd.h"
 #include "octeon_pip_pcs.h"
+
+/*
+ * Flow control, for the SGMII, QSGMII and PICMG ports.
+ *
+ * Receive: the GMX holds the transmitter back for a PAUSE frame it
+ * receives. Transmit: the GMX sends PAUSE frames while the IPD asserts
+ * backpressure for the port, which it does when more than a threshold of
+ * packet buffers hold packets of the port that no poll has taken yet, see
+ * opip_ipd_bp_sub(). The threshold is a quarter of the packet buffers in
+ * units of 256, the register's, and at least one unit: PAUSE frames come
+ * before RED drops (below a quarter of the pool free) for every pool of
+ * 342 buffers and more; on smaller ones the 256 buffers are above the
+ * RED marks and RED drops first. Which of the two is on is
+ * phylink's to say (negotiated by default, ethtool -A), applied at link
+ * up, see opip_mac_link_up().
+ */
+
+static void opip_pause_apply(struct opip_port *p, bool rx, bool tx)
+{
+	int iface = p->iface->num;
+
+	lockdep_assert_held(&p->opip->hw_lock);
+	p->pause_rx = rx;
+	p->pause_tx = tx;
+	opip_gmx_set_pause(iface, p->index, rx);
+	opip_gmx_clear_bp_override(iface, p->index);
+	opip_ipd_bp_config(p->port, tx,
+			   max_t(unsigned int, 1,
+				 READ_ONCE(p->opip->num_packet_buffers) /
+				 (4 * 256)));
+}
+
+/**
+ * opip_pause_refresh - apply a port's flow control state again
+ * @p: Port
+ *
+ * The thresholds follow the packet pool's size: set the state again, with
+ * the receive and transmit settings last applied. Under hw_lock, against
+ * phylink's link changes.
+ */
+void opip_pause_refresh(struct opip_port *p)
+{
+	if (!opip_port_pause_capable(p))
+		return;
+	mutex_lock(&p->opip->hw_lock);
+	opip_pause_apply(p, p->pause_rx, p->pause_tx);
+	mutex_unlock(&p->opip->hw_lock);
+}
 
 /**
  * opip_port_link - the link state of a port
@@ -136,6 +185,15 @@ static void opip_mac_link_down(struct phylink_config *config, unsigned int mode,
 	struct opip_link down = { };
 
 	opip_link_change(p, &down);
+	/*
+	 * Do not leave the link partner paused, also when the port is
+	 * stopped: phylink_stop() takes the link down here.
+	 */
+	if (opip_port_pause_capable(p)) {
+		mutex_lock(&p->opip->hw_lock);
+		opip_pause_apply(p, p->pause_rx, false);
+		mutex_unlock(&p->opip->hw_lock);
+	}
 }
 
 static void opip_mac_link_up(struct phylink_config *config,
@@ -151,6 +209,13 @@ static void opip_mac_link_up(struct phylink_config *config,
 	};
 
 	opip_link_change(p, &link);
+	/* No PAUSE frames on a half duplex link */
+	if (opip_port_pause_capable(p)) {
+		mutex_lock(&p->opip->hw_lock);
+		opip_pause_apply(p, rx_pause && link.full_duplex,
+				 tx_pause && link.full_duplex);
+		mutex_unlock(&p->opip->hw_lock);
+	}
 }
 
 static const struct phylink_mac_ops opip_phylink_mac_ops = {
@@ -203,6 +268,8 @@ int opip_phylink_create(struct opip_port *p)
 		config->mac_capabilities = MAC_10000FD;
 		fixed.speed = SPEED_10000;
 	}
+	if (opip_port_pause_capable(p))
+		config->mac_capabilities |= MAC_SYM_PAUSE | MAC_ASYM_PAUSE;
 
 	phy_less = true;
 	if (np) {

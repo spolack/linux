@@ -14,6 +14,7 @@
 #include <linux/string.h>
 
 #include "octeon_pip.h"
+#include "octeon_pip_rx.h"
 
 /*
  * The counters of ethtool -S, in the order opip_get_ethtool_stats() fills them
@@ -188,6 +189,43 @@ static void opip_get_rmon_stats(struct net_device *dev,
 	*ranges = opip_rmon_ranges;
 }
 
+/*
+ * The receive ring is the packet pool, shared by all ports: every port
+ * shows and sets the same size. The transmit rings are fixed.
+ */
+static void opip_get_ringparam(struct net_device *dev,
+			       struct ethtool_ringparam *ring,
+			       struct kernel_ethtool_ringparam *kring,
+			       struct netlink_ext_ack *extack)
+{
+	struct opip_port *p = opip_port(dev);
+
+	ring->rx_max_pending = OPIP_MAX_PACKET_BUFFERS;
+	ring->rx_pending = READ_ONCE(p->opip->num_packet_buffers);
+	ring->tx_max_pending = OPIP_TXQ_DEPTH;
+	ring->tx_pending = OPIP_TXQ_DEPTH;
+}
+
+static int opip_set_ringparam(struct net_device *dev,
+			      struct ethtool_ringparam *ring,
+			      struct kernel_ethtool_ringparam *kring,
+			      struct netlink_ext_ack *extack)
+{
+	struct opip_port *p = opip_port(dev);
+
+	if (ring->tx_pending != OPIP_TXQ_DEPTH) {
+		NL_SET_ERR_MSG_MOD(extack, "the transmit ring size is fixed");
+		return -EINVAL;
+	}
+	if (ring->rx_pending < OPIP_MIN_PACKET_BUFFERS) {
+		NL_SET_ERR_MSG_FMT_MOD(extack,
+				       "the receive ring has at least %u buffers",
+				       OPIP_MIN_PACKET_BUFFERS);
+		return -EINVAL;
+	}
+	return opip_rx_resize(p->opip, ring->rx_pending);
+}
+
 static int opip_nway_reset(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
@@ -195,6 +233,25 @@ static int opip_nway_reset(struct net_device *dev)
 	if (!p->phylink)
 		return -EOPNOTSUPP;
 	return phylink_ethtool_nway_reset(p->phylink);
+}
+
+static void opip_get_pauseparam(struct net_device *dev,
+				struct ethtool_pauseparam *pause)
+{
+	struct opip_port *p = opip_port(dev);
+
+	if (p->phylink && opip_port_pause_capable(p))
+		phylink_ethtool_get_pauseparam(p->phylink, pause);
+}
+
+static int opip_set_pauseparam(struct net_device *dev,
+			       struct ethtool_pauseparam *pause)
+{
+	struct opip_port *p = opip_port(dev);
+
+	if (!p->phylink || !opip_port_pause_capable(p))
+		return -EOPNOTSUPP;
+	return phylink_ethtool_set_pauseparam(p->phylink, pause);
 }
 
 static int opip_get_link_ksettings(struct net_device *dev,
@@ -221,9 +278,13 @@ const struct ethtool_ops opip_ethtool_ops = {
 	.nway_reset = opip_nway_reset,
 	.get_link = ethtool_op_get_link,
 	.get_ts_info = ethtool_op_get_ts_info,
+	.get_pauseparam = opip_get_pauseparam,
+	.set_pauseparam = opip_set_pauseparam,
 	.get_pause_stats = opip_get_pause_stats,
 	.get_link_ksettings = opip_get_link_ksettings,
 	.set_link_ksettings = opip_set_link_ksettings,
+	.get_ringparam = opip_get_ringparam,
+	.set_ringparam = opip_set_ringparam,
 	.get_sset_count = opip_get_sset_count,
 	.get_strings = opip_get_strings,
 	.get_ethtool_stats = opip_get_ethtool_stats,

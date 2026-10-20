@@ -330,6 +330,27 @@ void opip_gmx_set_speed(int iface, int index, const struct opip_link *link,
 }
 
 /**
+ * opip_gmx_set_pause - set a port's receive flow control
+ * @iface: Interface
+ * @index: Port on it
+ * @rx:    Honour PAUSE frames
+ *
+ * Receive flow control: the GMX holds the transmitter back for a PAUSE
+ * frame it receives; the frames themselves are always dropped.
+ */
+void opip_gmx_set_pause(int iface, int index, bool rx)
+{
+	u64 ctl = opip_rd(OPIP_GMX_RX_FRM_CTL(iface, index));
+
+	ctl |= OPIP_GMX_RX_FRM_CTL_CTL_DRP;
+	if (rx)
+		ctl |= OPIP_GMX_RX_FRM_CTL_CTL_BCK;
+	else
+		ctl &= ~OPIP_GMX_RX_FRM_CTL_CTL_BCK;
+	opip_wr(OPIP_GMX_RX_FRM_CTL(iface, index), ctl);
+}
+
+/**
  * opip_gmx_stats_init - set a port's MAC counters to clear on read
  * @iface: Interface
  * @index: Port on it
@@ -399,6 +420,24 @@ void opip_gmx_read_stats(int iface, int index, struct opip_gmx_stats *s)
 				    st[OPIP_GMX_TX_STAT_CTL]);
 	s->tx_ctl_packets = FIELD_GET(OPIP_GMX_TX_STAT_LO,
 				      st[OPIP_GMX_TX_STAT_CTL]);
+}
+
+/**
+ * opip_gmx_clear_bp_override - clear a port's backpressure override
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * A bootloader may have left the override on that tells the GMX there is
+ * no backpressure whatever the IPD says. The register is shared by the
+ * ports of the interface: the caller holds hw_lock.
+ */
+void opip_gmx_clear_bp_override(int iface, int index)
+{
+	u64 ovr = opip_rd(OPIP_GMX_TX_OVR_BP(iface));
+
+	ovr &= ~(FIELD_PREP(OPIP_GMX_TX_OVR_BP_EN, BIT(index)) |
+		 FIELD_PREP(OPIP_GMX_TX_OVR_BP_BP, BIT(index)));
+	opip_wr(OPIP_GMX_TX_OVR_BP(iface), ovr);
 }
 
 /**

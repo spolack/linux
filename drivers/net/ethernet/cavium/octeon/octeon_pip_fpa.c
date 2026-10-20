@@ -160,6 +160,31 @@ unsigned int opip_fpa_fill_packet_pool(struct page_pool *pp,
 }
 
 /**
+ * opip_fpa_alloc_packet_buf - take a packet buffer from a page_pool
+ * @pp:  page_pool to take it from
+ * @gfp: Allocation flags for a new page
+ *
+ * A whole page or a slice of one, as opip_fpa_fill_packet_pool() takes
+ * them, for a caller that puts it into the packet pool later (with a
+ * barrier before, as there) or gives it back with
+ * opip_fpa_put_packet_buf().
+ *
+ * Return: the buffer, NULL if there was none
+ */
+void *opip_fpa_alloc_packet_buf(struct page_pool *pp, gfp_t gfp)
+{
+	unsigned int offset = 0;
+	struct page *page;
+
+	if (OPIP_RX_SPLIT)
+		page = page_pool_alloc_frag(pp, &offset, OPIP_RX_FRAG_SIZE,
+					    gfp);
+	else
+		page = page_pool_alloc_pages(pp, gfp);
+	return page ? page_address(page) + offset : NULL;
+}
+
+/**
  * opip_fpa_put_packet_buf - give a packet buffer back to its page_pool
  * @buf: The buffer, not in the packet pool
  *

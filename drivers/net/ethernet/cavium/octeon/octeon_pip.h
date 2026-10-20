@@ -53,6 +53,7 @@ struct platform_device;
  */
 #define OPIP_RX_RING_PER_PORT	128
 #define OPIP_DEFAULT_PACKET_BUFFERS	1024
+#define OPIP_MIN_PACKET_BUFFERS	256
 #define OPIP_MAX_PACKET_BUFFERS	16384
 
 /*
@@ -229,6 +230,9 @@ struct opip_port {
 	unsigned int		last_speed;
 	/* Open, and the periodic worker checks for preamble errors */
 	bool			preamble_polling;
+	/* The flow control last applied, under hw_lock */
+	bool			pause_rx;
+	bool			pause_tx;
 	/* Pad frames under 64 bytes: CN3XXX, GMX port, half duplex (GMX-401) */
 	bool			pad_runts;
 	/* RGMII: the ASX clock delay steps, negative for the chip's default */
@@ -317,9 +321,10 @@ struct opip_group {
 struct opip {
 	struct platform_device *pdev;
 	/*
-	 * The size of the packet pool: the buffers free in the FPA, the ones
-	 * the IPD, the POW and the PKO hold, and the ones the polls owe
-	 * (to_refill: handed to the stack) add up to this
+	 * The size of the packet pool, the receive ring (ethtool -G): the
+	 * buffers free in the FPA, the ones the IPD, the POW and the PKO
+	 * hold, and the ones the polls owe (to_refill: handed to the stack)
+	 * add up to this plus rx_excess
 	 */
 	unsigned int num_packet_buffers;
 	int num_ifaces;
@@ -350,7 +355,16 @@ struct opip {
 	/* What was put into the pools, to check what comes back */
 	unsigned int wqe_bufs;
 	unsigned int cmd_bufs;
+	/* The receive share of wqe_bufs, see opip_rx_resize() */
+	unsigned int rx_wqe_bufs;
 	struct dentry *debugfs;
+	/*
+	 * Buffers a shrink of the packet pool could not take out yet: the
+	 * polls replace that many fewer, see opip_rx_refill(). Every poll
+	 * that refills reads it: a line of its own, which only a shrink
+	 * and the polls paying it off write.
+	 */
+	atomic_t rx_excess ____cacheline_aligned_in_smp;
 };
 
 static inline struct opip_port *opip_port(struct net_device *dev)
@@ -406,6 +420,12 @@ static inline bool opip_port_has_pcs(const struct opip_port *p)
 	       p->iface->mode == OPIP_MODE_PICMG;
 }
 
+/* Flow control: the PCS ports of the chips without port kinds */
+static inline bool opip_port_pause_capable(const struct opip_port *p)
+{
+	return opip_port_has_pcs(p) && !opip_chip->cn68xx;
+}
+
 /* octeon_pip_main.c */
 int opip_link_set(struct opip_port *p, const struct opip_link *link);
 int opip_pcs_setup(struct opip_port *p, bool inband);
@@ -417,6 +437,7 @@ void opip_get_gmx_stats(struct net_device *dev, struct opip_gmx_stats *gmx);
 
 /* octeon_pip_link.c */
 int opip_phylink_create(struct opip_port *p);
+void opip_pause_refresh(struct opip_port *p);
 void opip_check_preamble_errors(struct net_device *dev);
 struct opip_link opip_port_link(struct opip_port *p);
 

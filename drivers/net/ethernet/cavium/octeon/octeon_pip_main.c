@@ -1828,6 +1828,7 @@ static int opip_hw_init(struct opip *opip)
 	/* Every received packet takes an entry; the ports add their share */
 	opip->wqe_bufs = opip_fpa_fill(opip, OPIP_POOL_WQE, OPIP_POOL_WQE_SIZE,
 				       opip->num_packet_buffers);
+	opip->rx_wqe_bufs = opip->wqe_bufs;
 	opip->cmd_bufs = opip_fpa_fill(opip, OPIP_POOL_CMD, OPIP_POOL_CMD_SIZE,
 				       OPIP_NUM_CMD_CHUNKS);
 	if (opip->wqe_bufs < opip->num_packet_buffers ||
@@ -1935,13 +1936,17 @@ static void opip_free_hw(struct opip *opip, bool drain)
 
 	/* The polls are down: none can queue the refill worker again */
 	cancel_delayed_work_sync(&opip->refill_work);
-	/* What the polls still owe the packet pool is not in it */
+	/*
+	 * What the polls still owe the packet pool is not in it; what a
+	 * shrink could not take out yet still is
+	 */
 	for (i = 0; i < OPIP_MAX_GROUPS; i++)
 		owed += opip->groups[i].to_refill;
 	opip_pko_reset();
 	if (drain)
 		opip_ipd_drain();
-	opip_fpa_empty_packet_pool(opip, opip->num_packet_buffers - owed);
+	opip_fpa_empty_packet_pool(opip, opip->num_packet_buffers +
+				   atomic_read(&opip->rx_excess) - owed);
 	/* The IPD's count of the packet pool is zero again with the pool */
 	opip_ipd_reset();
 	opip_rx_free_pools(opip);

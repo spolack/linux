@@ -39,6 +39,7 @@ void opip_ipd_drain(void);
 void opip_ipd_reset(void);
 void opip_ipd_red_setup(unsigned int pass, unsigned int drop);
 void opip_ipd_fcs_strip(int port, bool strip);
+void opip_ipd_bp_config(int port, bool enable, unsigned int page_cnt);
 unsigned int opip_ipd_bp_count(int port);
 bool opip_ipd_bp_limit(int port, unsigned int *limit);
 unsigned int opip_ipd_pool_count(void);

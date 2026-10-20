@@ -411,6 +411,26 @@ static __always_inline struct opip_wqe *opip_rx_next_work(void)
 }
 
 /*
+ * Pay off what a shrink of the packet pool could not take out, from @n
+ * buffers a poll would replace: they are out of the pool already (with
+ * the stack), and not replacing them takes them out for good. Returns
+ * the number paid.
+ */
+static noinline unsigned int opip_rx_pay_excess(atomic_t *excess,
+						unsigned int n)
+{
+	int old = atomic_read(excess);
+	unsigned int pay;
+
+	do {
+		pay = min_t(unsigned int, old, n);
+		if (!pay)
+			break;
+	} while (!atomic_try_cmpxchg(excess, &old, old - pay));
+	return pay;
+}
+
+/*
  * Replace the packet buffers the poll handed to skbs or XDP. Only the poll
  * of the group allocates from its page pool, so this runs in the poll;
  * opip_rx_refill_check() schedules a poll if the pool ran low with the
@@ -422,6 +442,9 @@ static unsigned int opip_rx_refill(struct opip_group *group)
 
 	if (!n)
 		return 0;
+	/* The pool was made smaller: replace fewer */
+	if (unlikely(atomic_read(&group->opip->rx_excess)))
+		n -= opip_rx_pay_excess(&group->opip->rx_excess, n);
 	n -= opip_fpa_fill_packet_pool(group->pp, n, GFP_ATOMIC);
 	WRITE_ONCE(group->to_refill, n);
 	return n;
@@ -641,6 +664,145 @@ void opip_rx_refill_check(struct opip *opip)
 		if ((opip->groups_mask & BIT(i)) &&
 		    READ_ONCE(opip->groups[i].to_refill))
 			opip_group_schedule(&opip->groups[i]);
+}
+
+/*
+ * Grow the packet pool from @have to @count buffers, all or nothing. The
+ * entries the buffers need come first: more than needed are harmless,
+ * the receive share of the WQE pool grows to the largest size asked for.
+ * What a shrink could not take out yet is still in the hardware's hands
+ * or owed: it counts against the growth. The rest comes from the first
+ * group's page pool, with its poll held off (only the poll allocates
+ * from it), into a staging array, and goes into the pool only once it is
+ * all there; putting it there cannot fail.
+ */
+static int opip_rx_grow(struct opip *opip, unsigned int have,
+			unsigned int count)
+{
+	unsigned int add = count - have, pending, n, i;
+	struct opip_group *group = NULL;
+	void **bufs;
+	int ret = 0;
+
+	if (count > opip->rx_wqe_bufs) {
+		n = opip_fpa_fill(opip, OPIP_POOL_WQE, OPIP_POOL_WQE_SIZE,
+				  count - opip->rx_wqe_bufs);
+		opip->wqe_bufs += n;
+		opip->rx_wqe_bufs += n;
+		if (opip->rx_wqe_bufs < count)
+			return -ENOMEM;
+	}
+
+	pending = atomic_xchg(&opip->rx_excess, 0);
+	if (pending >= add) {
+		atomic_add(pending - add, &opip->rx_excess);
+		return 0;
+	}
+	add -= pending;
+
+	bufs = kvmalloc_array(add, sizeof(*bufs), GFP_KERNEL);
+	if (!bufs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < OPIP_MAX_GROUPS && !group; i++)
+		if (opip->groups[i].pp)
+			group = &opip->groups[i];
+
+	napi_disable(&group->napi);
+	for (n = 0; n < add; n++) {
+		bufs[n] = opip_fpa_alloc_packet_buf(group->pp, GFP_KERNEL);
+		if (!bufs[n])
+			break;
+	}
+	if (n == add) {
+		/* The pages' writes out before the IPD may fill them */
+		wmb();
+		for (i = 0; i < n; i++)
+			opip_fpa_free_nosync(bufs[i], OPIP_POOL_PACKET,
+					     OPIP_POOL_PACKET_SIZE / 128);
+	} else {
+		while (n--)
+			opip_fpa_put_packet_buf(bufs[n]);
+		ret = -ENOMEM;
+	}
+	/* Have the poll run for an interrupt that found it disabled */
+	napi_enable(&group->napi);
+	opip_group_schedule(group);
+	kvfree(bufs);
+out:
+	if (ret)
+		atomic_add(pending, &opip->rx_excess);
+	return ret;
+}
+
+/*
+ * Take @take buffers out of the packet pool, which is to have @count:
+ * the free ones go back to their page pools now, as long as the pool
+ * stays above the RED pass mark of the new size, so that a shrink under
+ * load makes RED drop nothing; the rest, and what an earlier shrink left
+ * over, the polls pay off as they replace the buffers the stack took
+ * (opip_rx_refill()). Under load most of the pool is in flight, so this
+ * does not wait for it.
+ */
+static void opip_rx_shrink(struct opip *opip, unsigned int count,
+			   unsigned int take)
+{
+	unsigned int taken = 0;
+	void *buf;
+
+	take += atomic_xchg(&opip->rx_excess, 0);
+	/* The level read each time: the IPD keeps taking buffers meanwhile */
+	while (taken < take &&
+	       opip_fpa_level(OPIP_POOL_PACKET) > count / 4) {
+		buf = opip_fpa_alloc(OPIP_POOL_PACKET);
+		if (!buf)
+			break;
+		opip_fpa_put_packet_buf(buf);
+		taken++;
+	}
+	atomic_add(take - taken, &opip->rx_excess);
+}
+
+/**
+ * opip_rx_resize - change the size of the packet pool, the receive ring
+ * @opip:  The complex, under rtnl
+ * @count: Buffers the pool is to have: free ones, ones the hardware
+ *         holds and ones the polls owe it, not the ones skbs hold
+ *
+ * Growing either brings the pool to @count or changes nothing, see
+ * opip_rx_grow(). Shrinking cannot fail: what the pool cannot give back
+ * now, the polls give back later, see opip_rx_shrink(). The size is
+ * @count from here on, for ethtool -g too, and RED and the backpressure
+ * thresholds follow it; on a shrink before the buffers are taken out,
+ * so that the old drop mark does not drop in the meantime.
+ *
+ * Return: 0, or -ENOMEM if the pool could not grow; it is as it was
+ */
+int opip_rx_resize(struct opip *opip, unsigned int count)
+{
+	unsigned int have = opip->num_packet_buffers;
+	int ret, i;
+
+	if (count == have)
+		return 0;
+	if (count > have) {
+		ret = opip_rx_grow(opip, have, count);
+		if (ret)
+			return ret;
+	}
+	WRITE_ONCE(opip->num_packet_buffers, count);
+
+	mutex_lock(&opip->hw_lock);
+	opip_ipd_red_setup(count / 4, count / 8);
+	mutex_unlock(&opip->hw_lock);
+	for (i = 0; i < OPIP_MAX_PORTS; i++)
+		if (opip->ports[i])
+			opip_pause_refresh(opip_port(opip->ports[i]));
+
+	if (count < have)
+		opip_rx_shrink(opip, count, have - count);
+	return 0;
 }
 
 static void opip_group_shutdown(struct opip_group *group)

@@ -320,6 +320,21 @@ struct opip_link opip_pcs_link(int iface, int index)
 }
 
 /*
+ * Set the pause a 1000BASE-X PCS advertises, PCS_AN_ADV[PAUSE]: bit 0
+ * symmetric, bit 1 asymmetric. Return: true if the advertisement changed.
+ */
+static bool opip_pcs_set_pause(int iface, int index, unsigned int pause)
+{
+	u64 adv = opip_rd(OPIP_PCS_AN_ADV(iface, index));
+
+	if (FIELD_GET(OPIP_PCS_AN_ADV_PAUSE, adv) == pause)
+		return false;
+	opip_wr(OPIP_PCS_AN_ADV(iface, index),
+		u64_replace_bits(adv, pause, OPIP_PCS_AN_ADV_PAUSE));
+	return true;
+}
+
+/*
  * A port's GMX disabled and polled idle around a change of the link
  * setup, its enable state restored afterwards: opip_pcs_gmx_hold() returns
  * whether it was enabled, or a negative errno if the GMX did not go idle
@@ -481,8 +496,23 @@ static int opip_pcs_ops_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 			       bool permit_pause_to_mac)
 {
 	struct opip_port *p = opip_pcs_port(pcs);
+	unsigned int pause = 0;
+	bool changed = false;
 	int ret;
 
+	/* The 1000BASE-X advertisement follows ethtool's pause settings */
+	if (interface == PHY_INTERFACE_MODE_1000BASEX &&
+	    opip_port_pause_capable(p)) {
+		if (linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+				      advertising))
+			pause |= 1;
+		if (linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
+				      advertising))
+			pause |= 2;
+		mutex_lock(&p->opip->hw_lock);
+		changed = opip_pcs_set_pause(p->iface->num, p->index, pause);
+		mutex_unlock(&p->opip->hw_lock);
+	}
 	/*
 	 * Out of band and INBAND_DISABLED (1000BASE-X without the
 	 * autonegotiation) are the same to the PCS: AN_EN off, the speed and
@@ -493,7 +523,7 @@ static int opip_pcs_ops_config(struct phylink_pcs *pcs, unsigned int neg_mode,
 		netdev_err(p->netdev, "setting up the PCS failed: %d\n", ret);
 		return ret;
 	}
-	return 0;
+	return changed;
 }
 
 static void opip_pcs_ops_an_restart(struct phylink_pcs *pcs)
