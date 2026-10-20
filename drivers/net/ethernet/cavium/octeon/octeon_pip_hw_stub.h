@@ -72,6 +72,16 @@ static inline unsigned int opip_core(void)
 	return raw_smp_processor_id();
 }
 
+static inline bool opip_on_simulator(void)
+{
+	return false;
+}
+
+static inline unsigned int opip_clock_hz(void)
+{
+	return 1000000000;
+}
+
 static inline void opip_errata_qlm_cdr(void)
 {
 }

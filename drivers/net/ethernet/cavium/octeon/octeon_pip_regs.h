@@ -17,6 +17,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
+#include <linux/mii.h>
 #include <linux/types.h>
 
 #include "octeon_pip_hw.h"
@@ -53,12 +54,19 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 }
 
 #define OPIP_GMX_PRT_CFG(i, p)		opip_gmx_port_reg(i, p, 0x010)
+#define OPIP_GMX_RX_FRM_CTL(i, p)	opip_gmx_port_reg(i, p, 0x018)
 #define OPIP_GMX_RX_FRM_MAX(i, p)	opip_gmx_port_reg(i, p, 0x030)
 #define OPIP_GMX_RX_JABBER(i, p)	opip_gmx_port_reg(i, p, 0x038)
 #define OPIP_GMX_RX_ADR_CTL(i, p)	opip_gmx_port_reg(i, p, 0x100)
 #define OPIP_GMX_RX_ADR_CAM_EN(i, p)	opip_gmx_port_reg(i, p, 0x108)
 #define OPIP_GMX_RX_ADR_CAM(i, p, n)	opip_gmx_port_reg(i, p, 0x180 + (n) * 8)
+#define OPIP_GMX_TX_THRESH(i, p)	opip_gmx_port_reg(i, p, 0x210)
+#define OPIP_GMX_TX_APPEND(i, p)	opip_gmx_port_reg(i, p, 0x218)
+#define OPIP_GMX_TX_SLOT(i, p)		opip_gmx_port_reg(i, p, 0x220)
+#define OPIP_GMX_TX_BURST(i, p)		opip_gmx_port_reg(i, p, 0x228)
 #define OPIP_GMX_SMAC(i, p)		opip_gmx_port_reg(i, p, 0x230)
+#define OPIP_GMX_RX_PRTS(i)		opip_gmx_reg(i, 0x410)
+#define OPIP_GMX_TX_PRTS(i)		opip_gmx_reg(i, 0x480)
 #define OPIP_GMX_INF_MODE(i)		opip_gmx_reg(i, 0x7F8)
 
 /* GMX_PRTn_CFG */
@@ -71,12 +79,36 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_GMX_PRT_CFG_SPEED		BIT_ULL(1)
 #define OPIP_GMX_PRT_CFG_EN		BIT_ULL(0)
 
+/* GMX_RXn_FRM_CTL; PTP_MODE is CN63XX and later, reserved (0) before */
+#define OPIP_GMX_RX_FRM_CTL_PTP_MODE	BIT_ULL(12)
+#define OPIP_GMX_RX_FRM_CTL_PRE_FREE	BIT_ULL(6)
+#define OPIP_GMX_RX_FRM_CTL_CTL_BCK	BIT_ULL(3)
+#define OPIP_GMX_RX_FRM_CTL_CTL_DRP	BIT_ULL(2)
+#define OPIP_GMX_RX_FRM_CTL_PRE_CHK	BIT_ULL(0)
+
 /* GMX_RXn_ADR_CTL */
 #define OPIP_GMX_RX_ADR_CTL_CAM_MODE	BIT_ULL(3)
 #define OPIP_GMX_RX_ADR_CTL_MCST	GENMASK_ULL(2, 1)
 #define OPIP_GMX_RX_ADR_CTL_MCST_REJECT	1
 #define OPIP_GMX_RX_ADR_CTL_MCST_ACCEPT	2
 #define OPIP_GMX_RX_ADR_CTL_BCST	BIT_ULL(0)
+
+/* GMX_TXn_THRESH */
+#define OPIP_GMX_TX_THRESH_CNT		GENMASK_ULL(9, 0)
+
+/* GMX_TXn_SLOT and GMX_TXn_BURST, in bit times: 10/100 and 1000 Mbit/s */
+#define OPIP_GMX_TX_SLOT_10_100		64
+#define OPIP_GMX_TX_SLOT_1000		512
+#define OPIP_GMX_TX_BURST_10_100	0
+#define OPIP_GMX_TX_BURST_1000		8192
+
+/* GMX_TXn_APPEND */
+#define OPIP_GMX_TX_APPEND_FCS		BIT_ULL(2)
+#define OPIP_GMX_TX_APPEND_PAD		BIT_ULL(1)
+
+/* GMX_TX_PRTS, GMX_RX_PRTS */
+#define OPIP_GMX_TX_PRTS_PRTS		GENMASK_ULL(4, 0)
+#define OPIP_GMX_RX_PRTS_PRTS		GENMASK_ULL(2, 0)
 
 /* GMX_INF_MODE */
 #define OPIP_GMX_INF_MODE_MODE		GENMASK_ULL(6, 4)
@@ -85,6 +117,72 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_GMX_INF_MODE_P0MII		BIT_ULL(2)
 #define OPIP_GMX_INF_MODE_EN		BIT_ULL(1)
 #define OPIP_GMX_INF_MODE_TYPE		BIT_ULL(0)
+
+/* ------------------------------------------------------------------ */
+/* PCS: the SGMII/1000BASE-X PCS of a port */
+
+#define OPIP_PCS_BASE		0x00011800B0001000ull
+
+static inline u64 opip_pcs_reg(int iface, int index, u64 off)
+{
+	return OPIP_CSR(OPIP_PCS_BASE + off + (u64)index * 1024 +
+			(u64)iface * opip_iface_stride());
+}
+
+#define OPIP_PCS_MR_CONTROL(i, p)	opip_pcs_reg(i, p, 0x000)
+#define OPIP_PCS_MR_STATUS(i, p)	opip_pcs_reg(i, p, 0x008)
+#define OPIP_PCS_AN_ADV(i, p)		opip_pcs_reg(i, p, 0x010)
+#define OPIP_PCS_AN_LP_ABIL(i, p)	opip_pcs_reg(i, p, 0x018)
+#define OPIP_PCS_AN_RESULTS(i, p)	opip_pcs_reg(i, p, 0x020)
+#define OPIP_PCS_LINK_TIMER_COUNT(i, p)	opip_pcs_reg(i, p, 0x040)
+#define OPIP_PCS_SGM_AN_ADV(i, p)	opip_pcs_reg(i, p, 0x068)
+#define OPIP_PCS_MISC_CTL(i, p)		opip_pcs_reg(i, p, 0x078)
+#define OPIP_PCS_INT_REG(i, p)		opip_pcs_reg(i, p, 0x080)
+
+/* PCS_MRn_CONTROL: the clause 22 BMCR */
+#define OPIP_PCS_MR_CONTROL_RESET	BMCR_RESET
+#define OPIP_PCS_MR_CONTROL_LOOPBCK1	BMCR_LOOPBACK
+#define OPIP_PCS_MR_CONTROL_AN_EN	BMCR_ANENABLE
+#define OPIP_PCS_MR_CONTROL_PWR_DN	BMCR_PDOWN
+#define OPIP_PCS_MR_CONTROL_RST_AN	BMCR_ANRESTART
+/* Speed and duplex, mii_bmcr_encode_fixed() */
+#define OPIP_PCS_MR_CONTROL_FIXED \
+	(BMCR_SPEED1000 | BMCR_SPEED100 | BMCR_FULLDPLX)
+
+/* PCS_MRn_STATUS */
+#define OPIP_PCS_MR_STATUS_AN_CPT	BIT_ULL(5)
+#define OPIP_PCS_MR_STATUS_LNK_ST	BIT_ULL(2)
+
+/* PCS_ANn_ADV (1000BASE-X) */
+#define OPIP_PCS_AN_ADV_REM_FLT		GENMASK_ULL(13, 12)
+#define OPIP_PCS_AN_ADV_PAUSE		GENMASK_ULL(8, 7)
+#define OPIP_PCS_AN_ADV_HFD		BIT_ULL(6)
+#define OPIP_PCS_AN_ADV_FD		BIT_ULL(5)
+
+/* PCS_ANn_RESULTS */
+#define OPIP_PCS_AN_RESULTS_SPD		GENMASK_ULL(4, 3)
+#define OPIP_PCS_AN_RESULTS_AN_CPT	BIT_ULL(2)
+#define OPIP_PCS_AN_RESULTS_DUP		BIT_ULL(1)
+#define OPIP_PCS_AN_RESULTS_LINK_OK	BIT_ULL(0)
+
+/* PCS_LINKn_TIMER_COUNT */
+#define OPIP_PCS_LINK_TIMER_COUNT_COUNT	GENMASK_ULL(15, 0)
+
+/* PCS_SGMn_AN_ADV (SGMII PHY mode) */
+#define OPIP_PCS_SGM_AN_ADV_LINK	BIT_ULL(15)
+#define OPIP_PCS_SGM_AN_ADV_DUP		BIT_ULL(12)
+#define OPIP_PCS_SGM_AN_ADV_SPEED	GENMASK_ULL(11, 10)
+
+/* PCS_MISCn_CTL */
+#define OPIP_PCS_MISC_CTL_GMXENO	BIT_ULL(11)
+#define OPIP_PCS_MISC_CTL_MAC_PHY	BIT_ULL(9)
+#define OPIP_PCS_MISC_CTL_MODE		BIT_ULL(8)
+#define OPIP_PCS_MISC_CTL_SAMP_PT	GENMASK_ULL(6, 0)
+
+/* PCS_INTn_REG */
+#define OPIP_PCS_INT_TXFIFO		BIT_ULL(4)
+#define OPIP_PCS_INT_TXFIFU		BIT_ULL(3)
+#define OPIP_PCS_INT_AN_ERR		BIT_ULL(2)
 
 /* ------------------------------------------------------------------ */
 /* PIP: packet input parsing, per input port */
@@ -213,6 +311,7 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_PKO_REG(off)		OPIP_CSR(OPIP_PKO_BASE + (off))
 #define OPIP_PKO_REG_FLAGS		OPIP_PKO_REG(0x0000)
 #define OPIP_PKO_REG_CMD_BUF		OPIP_PKO_REG(0x0010)
+#define OPIP_PKO_REG_GMX_PORT_MODE	OPIP_PKO_REG(0x0018)
 #define OPIP_PKO_REG_QUEUE_MODE		OPIP_PKO_REG(0x0048)
 #define OPIP_PKO_REG_MIN_PKT		OPIP_PKO_REG(0x0070)
 #define OPIP_PKO_REG_QUEUE_PTRS1	OPIP_PKO_REG(0x0100)
@@ -230,6 +329,8 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
  */
 #define OPIP_PKO_REG_CMD_BUF_POOL	GENMASK_ULL(22, 20)
 #define OPIP_PKO_REG_CMD_BUF_SIZE	GENMASK_ULL(12, 0)
+#define OPIP_PKO_REG_GMX_PORT_MODE_MODE1	GENMASK_ULL(5, 3)
+#define OPIP_PKO_REG_GMX_PORT_MODE_MODE0	GENMASK_ULL(2, 0)
 #define OPIP_PKO_REG_QUEUE_MODE_MODE	GENMASK_ULL(1, 0)
 
 /* PKO_REG_QUEUE_PTRS1, the high bits of PKO_MEM_QUEUE_PTRS on CN5XXX+ */
@@ -292,5 +393,15 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_L2C_CFG			OPIP_CSR(0x0001180080000000ull)
 #define OPIP_L2C_CFG_RFB_ARB_MODE	BIT_ULL(1)
 #define OPIP_L2C_CFG_LRF_ARB_MODE	BIT_ULL(0)
+
+/* ------------------------------------------------------------------ */
+/*
+ * Register field helper: read, modify and write back a field whose mask
+ * is selected at run time (u64_replace_bits() wants a constant one)
+ */
+static inline u64 opip_field_set_var(u64 reg, u64 mask, u64 val)
+{
+	return (reg & ~mask) | ((val << __ffs64(mask)) & mask);
+}
 
 #endif /* OCTEON_PIP_REGS_H */

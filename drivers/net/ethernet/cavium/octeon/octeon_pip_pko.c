@@ -281,3 +281,34 @@ void opip_pko_reset(void)
 	opip_wr(OPIP_PKO_REG_FLAGS,
 		opip_rd(OPIP_PKO_REG_FLAGS) | OPIP_PKO_REG_FLAGS_RESET);
 }
+
+/**
+ * opip_pko_gmx_port_mode - tell the PKO how many ports a GMX interface has
+ * @iface:     Interface, 0 or 1
+ * @num_ports: Ports on it
+ *
+ * PKO_REG_GMX_PORT_MODE, which CN30XX, CN31XX and CN50XX do not have.
+ */
+void opip_pko_gmx_port_mode(int iface, int num_ports)
+{
+	u64 mask = iface ? OPIP_PKO_REG_GMX_PORT_MODE_MODE1 :
+			   OPIP_PKO_REG_GMX_PORT_MODE_MODE0;
+	int mode;
+
+	if (opip_chip->small)
+		return;
+
+	if (num_ports == 1)
+		mode = 4;
+	else if (num_ports == 2)
+		mode = 3;
+	else if (num_ports <= 4)
+		mode = 2;
+	else if (num_ports <= 8)
+		mode = 1;
+	else
+		mode = 0;
+	opip_wr(OPIP_PKO_REG_GMX_PORT_MODE,
+		opip_field_set_var(opip_rd(OPIP_PKO_REG_GMX_PORT_MODE), mask,
+				   mode));
+}

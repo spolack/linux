@@ -16,9 +16,13 @@
 
 void opip_gmx_iface_enable(int iface);
 bool opip_gmx_iface_is_qsgmii(int iface);
+int opip_gmx_setup(int iface, int num_ports);
+bool opip_gmx_port_enabled(int iface, int index);
 void opip_gmx_port_enable(int iface, int index, bool en, int pknd);
 void opip_gmx_set_mac(int iface, int index, const u8 *addr);
 void opip_gmx_set_rx_filter(int iface, int index, bool promisc, bool allmulti);
 void opip_gmx_set_frame_max(int iface, int index, unsigned int max_frame);
+void opip_gmx_set_speed(int iface, int index, const struct opip_link *link);
+int opip_gmx_wait_idle(int iface, int index);
 
 #endif /* OCTEON_PIP_GMX_H */

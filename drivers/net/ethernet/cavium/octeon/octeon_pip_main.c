@@ -30,6 +30,7 @@
 #include "octeon_pip_fpa.h"
 #include "octeon_pip_gmx.h"
 #include "octeon_pip_ipd.h"
+#include "octeon_pip_pcs.h"
 #include "octeon_pip_pko.h"
 #include "octeon_pip_pow.h"
 #include "octeon_pip_regs.h"
@@ -37,6 +38,70 @@
 
 /* PKO command chunks put in the chunk pool */
 #define OPIP_NUM_CMD_CHUNKS	1024
+
+/* ------------------------------------------------------------------ */
+/* The link of a port, from the blocks that make it */
+
+/**
+ * opip_link_set - set up a port for a new link state
+ * @p:    Port
+ * @link: The new link state
+ *
+ * Return: zero on success
+ */
+int opip_link_set(struct opip_port *p, const struct opip_link *link)
+{
+	int iface = p->iface->num;
+	int ret = 0;
+
+	mutex_lock(&p->opip->hw_lock);
+	switch (p->iface->mode) {
+	case OPIP_MODE_SGMII:
+	case OPIP_MODE_PICMG:
+		ret = opip_pcs_link_set(iface, p->index, link);
+		break;
+	default:
+		break;
+	}
+	mutex_unlock(&p->opip->hw_lock);
+	return ret;
+}
+
+/**
+ * opip_pcs_setup - set the PCS of an SGMII, QSGMII or 1000BASE-X port up
+ * @p:      Port
+ * @inband: In-band autonegotiation, or the PCS forced out of band
+ *
+ * Set the PCS of an SGMII, QSGMII or 1000BASE-X port up for in-band or
+ * out-of-band operation, under the hardware lock. Ports of other modes
+ * are left alone.
+ *
+ * Return: 0, or the error of opip_pcs_config()
+ */
+int opip_pcs_setup(struct opip_port *p, bool inband)
+{
+	int ret = 0;
+
+	mutex_lock(&p->opip->hw_lock);
+	if (opip_port_has_pcs(p))
+		ret = opip_pcs_config(p->iface->num, p->index, inband);
+	mutex_unlock(&p->opip->hw_lock);
+	return ret;
+}
+
+/**
+ * opip_pcs_restart_an - restart the PCS autonegotiation of a PCS port
+ * @p: Port
+ *
+ * Under the hardware lock. Ports of other modes are left alone.
+ */
+void opip_pcs_restart_an(struct opip_port *p)
+{
+	mutex_lock(&p->opip->hw_lock);
+	if (opip_port_has_pcs(p))
+		opip_pcs_an_restart(p->iface->num, p->index);
+	mutex_unlock(&p->opip->hw_lock);
+}
 
 /**
  * opip_port_enable - enable or disable the MAC of a port that has one
@@ -185,12 +250,25 @@ static int opip_ndo_init(struct net_device *dev)
 static int opip_ndo_open(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
+	int ret;
 
 	/* NPI and LOOP: no MAC or link to bring up */
 	if (!opip_iface_is_gmx(p->iface))
 		return 0;
 
+	/* The simulator has no link: the port keeps the carrier on */
+	if (!p->phylink) {
+		opip_port_enable(p, true);
+		return 0;
+	}
+
+	ret = phylink_of_phy_connect(p->phylink, p->of_node, 0);
+	if (ret) {
+		netdev_err(dev, "could not attach the PHY: %d\n", ret);
+		return ret;
+	}
 	opip_port_enable(p, true);
+	phylink_start(p->phylink);
 	return 0;
 }
 
@@ -201,8 +279,25 @@ static int opip_ndo_stop(struct net_device *dev)
 	if (!opip_iface_is_gmx(p->iface))
 		return 0;
 
+	/*
+	 * With the MAC still on: the link goes down through mac_link_down(),
+	 * which also stops the PAUSE frames that hold the partner off
+	 */
+	if (p->phylink) {
+		phylink_stop(p->phylink);
+		phylink_disconnect_phy(p->phylink);
+	}
 	opip_port_enable(p, false);
 	return 0;
+}
+
+static int opip_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
+{
+	struct opip_port *p = opip_port(dev);
+
+	if (!netif_running(dev) || !p->phylink)
+		return -ENODEV;
+	return phylink_mii_ioctl(p->phylink, rq, cmd);
 }
 
 static const struct net_device_ops opip_netdev_ops = {
@@ -212,6 +307,7 @@ static const struct net_device_ops opip_netdev_ops = {
 	.ndo_start_xmit		= opip_xmit,
 	.ndo_set_rx_mode	= opip_set_rx_mode,
 	.ndo_set_mac_address	= opip_set_mac_address,
+	.ndo_eth_ioctl		= opip_ioctl,
 	.ndo_change_mtu		= opip_change_mtu,
 };
 
@@ -245,16 +341,44 @@ static struct device_node *opip_port_of_node(struct device_node *pip, int iface,
 	return np;
 }
 
+/*
+ * The SGMII interface mode covers QSGMII and 1000BASE-X as well. The PHY
+ * driver needs to know which: it configures the MAC side of the PHY
+ * accordingly. The hardware knows (the bootloader set it up), the device
+ * tree is only checked against it.
+ */
+static void opip_sgmii_phy_mode(struct opip_port *p)
+{
+	phy_interface_t dt_mode;
+
+	if (opip_pcs_basex(p->iface->num, p->index))
+		p->phy_mode = PHY_INTERFACE_MODE_1000BASEX;
+	else if (p->iface->qsgmii)
+		p->phy_mode = PHY_INTERFACE_MODE_QSGMII;
+	else
+		p->phy_mode = PHY_INTERFACE_MODE_SGMII;
+	if (p->of_node && !of_get_phy_mode(p->of_node, &dt_mode) &&
+	    dt_mode != p->phy_mode)
+		dev_warn(&p->opip->pdev->dev, "%pOF: phy-mode %s, but interface %d runs %s\n",
+			 p->of_node, phy_modes(dt_mode), p->iface->num,
+			 phy_modes(p->phy_mode));
+}
+
 /* Release what opip_alloc_port() took */
 static void opip_put_port(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
 
+	if (p->phylink)
+		phylink_destroy(p->phylink);
 	of_node_put(p->of_node);
 	free_netdev(dev);
 }
 
-/* A net_device for a port; failures only cost the port */
+/*
+ * A net_device for a port, with phylink created. Failures only cost the
+ * port.
+ */
 static struct net_device *opip_alloc_port(struct opip *opip,
 					  struct device_node *pip,
 					  struct opip_iface *iface, int index)
@@ -298,6 +422,7 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	p->index = index;
 	p->of_node = np;
 	dev->dev.of_node = np;
+	p->phy_mode = PHY_INTERFACE_MODE_NA;
 	INIT_WORK(&p->rx_mode_work, opip_rx_mode_worker);
 	netif_set_real_num_tx_queues(dev, min_t(int, num_queues,
 						num_possible_cpus()));
@@ -324,6 +449,7 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 		break;
 	case OPIP_MODE_SGMII:
 	case OPIP_MODE_PICMG:
+		opip_sgmii_phy_mode(p);
 		break;
 	default:
 		goto err_put;
@@ -336,6 +462,13 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	/* The port's node and its IPD/PKO port number, for user space */
 	device_set_node(&dev->dev, of_fwnode_handle(np));
 	dev->dev_port = port;
+
+	if (opip_iface_is_gmx(iface) && !opip_on_simulator() &&
+	    opip_phylink_create(p)) {
+		dev_err(&opip->pdev->dev, "failed to set up the link of interface %d port %d\n",
+			iface->num, index);
+		goto err_put;
+	}
 
 	return dev;
 
@@ -449,12 +582,18 @@ static void opip_probe_ifaces(struct opip *opip)
 
 /*
  * Bring the ports of an interface up, with the IPD enabled, the PKO not.
+ * A failure is reported, not fatal: the ports exist, their links stay
+ * down.
  */
 static void opip_iface_enable(struct opip *opip, struct opip_iface *iface)
 {
-	int index;
+	int index, ret = 0;
 
 	switch (iface->mode) {
+	case OPIP_MODE_SGMII:
+	case OPIP_MODE_PICMG:
+		ret = opip_sgmii_enable(iface->num, iface->num_ports);
+		break;
 	case OPIP_MODE_NPI:
 		/* Frames of any length; the host enables the ports */
 		if (opip_chip->gmx_frm_max)
@@ -468,6 +607,9 @@ static void opip_iface_enable(struct opip *opip, struct opip_iface *iface)
 	default:
 		break;
 	}
+	if (ret)
+		dev_err(&opip->pdev->dev, "interface %d (%s) did not come up: %d\n",
+			iface->num, opip_mode_names[iface->mode], ret);
 }
 
 /* ------------------------------------------------------------------ */
@@ -803,6 +945,28 @@ static int opip_hw_init(struct opip *opip)
 	return 0;
 }
 
+/*
+ * The interface bring-up enables the MAC of every SGMII and PICMG
+ * port. A port without a device has nobody to take its
+ * packets: off again.
+ */
+static void opip_iface_disable_unused(struct opip *opip,
+				      struct opip_iface *iface)
+{
+	int index;
+
+	switch (iface->mode) {
+	case OPIP_MODE_SGMII:
+	case OPIP_MODE_PICMG:
+		break;
+	default:
+		return;
+	}
+	for (index = 0; index < iface->num_ports; index++)
+		if (!opip->ports[opip_port_number(iface->num, index)])
+			opip_gmx_port_enable(iface->num, index, false, 0);
+}
+
 /* The interfaces on */
 static void opip_input_enable(struct opip *opip)
 {
@@ -812,6 +976,7 @@ static void opip_input_enable(struct opip *opip)
 		if (!opip->ifaces[i].num_ports)
 			continue;
 		opip_iface_enable(opip, &opip->ifaces[i]);
+		opip_iface_disable_unused(opip, &opip->ifaces[i]);
 	}
 }
 
@@ -1078,6 +1243,8 @@ static struct platform_driver opip_driver = {
 
 module_platform_driver(opip_driver);
 
+/* phylink connects the PHY at open: with both modules, the bus must exist */
+MODULE_SOFTDEP("pre: mdio-octeon");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Simon Polack <spolack+git@mailbox.org>");
 MODULE_DESCRIPTION("Cavium OCTEON PIP/PKO Ethernet driver");

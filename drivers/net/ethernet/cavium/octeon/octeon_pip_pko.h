@@ -22,4 +22,5 @@ bool opip_pko_port_valid(const struct opip *opip, int port);
 void opip_pko_init(struct opip *opip);
 void opip_pko_disable(void);
 void opip_pko_reset(void);
+void opip_pko_gmx_port_mode(int iface, int num_ports);
 #endif /* OCTEON_PIP_PKO_H */

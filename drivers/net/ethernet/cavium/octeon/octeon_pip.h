@@ -20,6 +20,8 @@
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/of.h>
+#include <linux/phy.h>
+#include <linux/phylink.h>
 #include <linux/smp.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -95,8 +97,13 @@ struct opip_port {
 	/* IPD/PKO port number, and the index on the interface */
 	int port;
 	int index;
+	phy_interface_t		phy_mode;
 	struct work_struct	rx_mode_work;
 	struct device_node	*of_node;
+	struct phylink		*phylink;
+	struct phylink_config	phylink_config;
+	/* The PCS of an SGMII port */
+	struct phylink_pcs	pcs;
 };
 
 /* The packet I/O complex */
@@ -163,7 +170,20 @@ static inline bool opip_port_has_gmx(const struct opip_port *p)
 	return p->iface->num < 2 && opip_iface_is_gmx(p->iface);
 }
 
+/* A port with a PCS: SGMII, QSGMII, or PICMG, which is SGMII to a backplane */
+static inline bool opip_port_has_pcs(const struct opip_port *p)
+{
+	return p->iface->mode == OPIP_MODE_SGMII ||
+	       p->iface->mode == OPIP_MODE_PICMG;
+}
+
 /* octeon_pip_main.c */
+int opip_link_set(struct opip_port *p, const struct opip_link *link);
+int opip_pcs_setup(struct opip_port *p, bool inband);
+void opip_pcs_restart_an(struct opip_port *p);
 void opip_port_enable(struct opip_port *p, bool en);
+
+/* octeon_pip_link.c */
+int opip_phylink_create(struct opip_port *p);
 
 #endif /* OCTEON_PIP_H */

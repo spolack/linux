@@ -31,6 +31,13 @@ enum opip_mode {
 	OPIP_MODE_LOOP,
 };
 
+/* A link state as the board or a PCS reports it */
+struct opip_link {
+	bool up;
+	bool full_duplex;
+	unsigned int speed;	/* Mbit/s */
+};
+
 #ifdef CONFIG_CAVIUM_OCTEON_SOC
 
 #include <asm/octeon/octeon.h>
@@ -38,6 +45,7 @@ enum opip_mode {
 #include <asm/octeon/cvmx-fpa.h>
 #include <asm/octeon/cvmx-helper.h>
 #include <asm/octeon/cvmx-helper-errata.h>
+#include <asm/octeon/cvmx-sysinfo.h>
 
 static inline u64 opip_rd(u64 addr)
 {
@@ -84,6 +92,16 @@ static inline void *opip_virt(u64 phys)
 static inline unsigned int opip_core(void)
 {
 	return cvmx_get_core_num();
+}
+
+static inline bool opip_on_simulator(void)
+{
+	return octeon_is_simulation();
+}
+
+static inline unsigned int opip_clock_hz(void)
+{
+	return cvmx_sysinfo_get()->cpu_clock_hz;
 }
 
 /* The interfaces as the bootloader strapped them, from the arch */

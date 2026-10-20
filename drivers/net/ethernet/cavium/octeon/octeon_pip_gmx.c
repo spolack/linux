@@ -10,10 +10,12 @@
  */
 
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 
 #include "octeon_pip.h"
 #include "octeon_pip_gmx.h"
+#include "octeon_pip_pko.h"
 #include "octeon_pip_regs.h"
 
 /**
@@ -45,6 +47,77 @@ bool opip_gmx_iface_is_qsgmii(int iface)
 	return FIELD_GET(OPIP_GMX_INF_MODE_MODE,
 			 opip_rd(OPIP_GMX_INF_MODE(iface))) ==
 	       OPIP_GMX_INF_MODE_MODE_QSGMII;
+}
+
+/**
+ * opip_gmx_setup - the common settings of a GMX: its port count
+ * @iface:     Interface
+ * @num_ports: Ports on it, four at most
+ *
+ * The port counts on the transmit and receive side, the PKO's view of
+ * them, and the transmit threshold: the GMX buffers as much of a packet
+ * as it can before it starts sending, so that memory contention cannot
+ * underrun a packet that fits the FIFO. CN68XX: the PKO adds padding
+ * and FCS, the GMX must not add them again.
+ *
+ * Return: 0, or -EINVAL for more ports than a GMX has
+ */
+int opip_gmx_setup(int iface, int num_ports)
+{
+	unsigned int thresh;
+	int index;
+
+	/* opip_iface_ports() counts at most four */
+	if (WARN_ON_ONCE(num_ports > 4))
+		return -EINVAL;
+	opip_wr(OPIP_GMX_TX_PRTS(iface),
+		u64_replace_bits(opip_rd(OPIP_GMX_TX_PRTS(iface)), num_ports,
+				 OPIP_GMX_TX_PRTS_PRTS));
+	opip_wr(OPIP_GMX_RX_PRTS(iface),
+		u64_replace_bits(opip_rd(OPIP_GMX_RX_PRTS(iface)), num_ports,
+				 OPIP_GMX_RX_PRTS_PRTS));
+	opip_pko_gmx_port_mode(iface, num_ports);
+
+	if (opip_chip->small)
+		thresh = 0x40;	/* the fixed maximum of these chips */
+	else if (num_ports <= 1)
+		thresh = 0x100;
+	else if (num_ports == 2)
+		thresh = 0x100 / 2;
+	else
+		thresh = 0x100 / 4;
+	for (index = 0; index < num_ports; index++) {
+		opip_wr(OPIP_GMX_TX_THRESH(iface, index),
+			u64_replace_bits(opip_rd(OPIP_GMX_TX_THRESH(iface,
+								    index)),
+					 thresh, OPIP_GMX_TX_THRESH_CNT));
+		if (opip_chip->cn68xx)
+			opip_wr(OPIP_GMX_TX_APPEND(iface, index),
+				opip_rd(OPIP_GMX_TX_APPEND(iface, index)) &
+				~(OPIP_GMX_TX_APPEND_FCS |
+				  OPIP_GMX_TX_APPEND_PAD));
+		/*
+		 * No timestamps: a bootloader's PTP_MODE would have the GMX
+		 * put eight bytes in front of every packet, and the PIP
+		 * skips none
+		 */
+		opip_wr(OPIP_GMX_RX_FRM_CTL(iface, index),
+			opip_rd(OPIP_GMX_RX_FRM_CTL(iface, index)) &
+			~OPIP_GMX_RX_FRM_CTL_PTP_MODE);
+	}
+	return 0;
+}
+
+/**
+ * opip_gmx_port_enabled - whether a port's MAC is enabled
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Return: true if GMX_PRT_CFG[EN] is set
+ */
+bool opip_gmx_port_enabled(int iface, int index)
+{
+	return opip_rd(OPIP_GMX_PRT_CFG(iface, index)) & OPIP_GMX_PRT_CFG_EN;
 }
 
 /**
@@ -140,4 +213,79 @@ void opip_gmx_set_frame_max(int iface, int index, unsigned int max_frame)
 	if (opip_chip->gmx_frm_max)
 		opip_wr(OPIP_GMX_RX_FRM_MAX(iface, index), max_frame);
 	opip_wr(OPIP_GMX_RX_JABBER(iface, index), round_up(max_frame, 8));
+}
+
+/**
+ * opip_gmx_wait_idle - wait for a disabled port's GMX to go idle
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Wait for the receive and transmit state machines of a disabled port.
+ *
+ * Return: 0, or -ETIMEDOUT if either does not go idle in 10 ms
+ */
+int opip_gmx_wait_idle(int iface, int index)
+{
+	u64 cfg;
+
+	if (read_poll_timeout(opip_rd, cfg, cfg & OPIP_GMX_PRT_CFG_RX_IDLE,
+			      10, 10000, false,
+			      OPIP_GMX_PRT_CFG(iface, index)) ||
+	    read_poll_timeout(opip_rd, cfg, cfg & OPIP_GMX_PRT_CFG_TX_IDLE,
+			      10, 10000, false,
+			      OPIP_GMX_PRT_CFG(iface, index)))
+		return -ETIMEDOUT;
+	return 0;
+}
+
+/**
+ * opip_gmx_set_speed - program a port's MAC for a link's speed and duplex
+ * @iface: Interface
+ * @index: Port on it
+ * @link:  The link; a down link keeps the speed and the duplex
+ *
+ * The caller has the port disabled.
+ */
+void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
+{
+	u64 cfg = opip_rd(OPIP_GMX_PRT_CFG(iface, index));
+	unsigned int speed = link->speed;
+
+	if (link->up) {
+		if (link->full_duplex)
+			cfg |= OPIP_GMX_PRT_CFG_DUPLEX;
+		else
+			cfg &= ~OPIP_GMX_PRT_CFG_DUPLEX;
+	}
+
+	switch (speed) {
+	case 10:
+		cfg &= ~(OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME);
+		cfg |= OPIP_GMX_PRT_CFG_SPEED_MSB;
+		opip_wr(OPIP_GMX_TX_SLOT(iface, index),
+			OPIP_GMX_TX_SLOT_10_100);
+		opip_wr(OPIP_GMX_TX_BURST(iface, index),
+			OPIP_GMX_TX_BURST_10_100);
+		break;
+	case 100:
+		cfg &= ~(OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME |
+			 OPIP_GMX_PRT_CFG_SPEED_MSB);
+		opip_wr(OPIP_GMX_TX_SLOT(iface, index),
+			OPIP_GMX_TX_SLOT_10_100);
+		opip_wr(OPIP_GMX_TX_BURST(iface, index),
+			OPIP_GMX_TX_BURST_10_100);
+		break;
+	case 1000:
+		cfg |= OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME;
+		cfg &= ~OPIP_GMX_PRT_CFG_SPEED_MSB;
+		opip_wr(OPIP_GMX_TX_SLOT(iface, index), OPIP_GMX_TX_SLOT_1000);
+		opip_wr(OPIP_GMX_TX_BURST(iface, index),
+			OPIP_GMX_TX_BURST_1000);
+		break;
+	default:
+		break;
+	}
+
+	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg);
+	opip_rd(OPIP_GMX_PRT_CFG(iface, index));
 }
