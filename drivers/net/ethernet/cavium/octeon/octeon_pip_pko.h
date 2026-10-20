@@ -72,6 +72,9 @@ void opip_pko_read_stats(struct opip *opip, int port, u32 *packets,
 			 u64 *octets);
 void opip_pko_clear_stats(struct opip *opip, int port);
 void opip_pko_gmx_port_mode(int iface, int num_ports);
+void opip_pko_xaui_ports(int iface);
+u64 opip_pko_queue_qos_disable(struct opip *opip, int queue, int port);
+void opip_pko_queue_qos_restore(struct opip *opip, int queue, u64 saved);
 bool opip_pko_write_next(struct opip_txq *txq, u64 w0, u64 w1);
 
 /**

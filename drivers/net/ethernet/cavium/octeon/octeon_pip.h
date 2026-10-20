@@ -224,6 +224,16 @@ struct opip_port {
 	int base_queue;
 	int num_queues;
 	phy_interface_t		phy_mode;
+	/* The link as phylink last set it up, for the RGMII preamble check */
+	struct opip_link	link;
+	unsigned int		last_speed;
+	/* Open, and the periodic worker checks for preamble errors */
+	bool			preamble_polling;
+	/* Pad frames under 64 bytes: CN3XXX, GMX port, half duplex (GMX-401) */
+	bool			pad_runts;
+	/* RGMII: the ASX clock delay steps, negative for the chip's default */
+	s8			rgmii_rx_delay;
+	s8			rgmii_tx_delay;
 	struct delayed_work	periodic_work;
 	struct work_struct	rx_mode_work;
 	struct device_node	*of_node;
@@ -382,6 +392,13 @@ static inline bool opip_port_has_gmx(const struct opip_port *p)
 	return p->iface->num < 2 && opip_iface_is_gmx(p->iface);
 }
 
+/* Only true RGMII ports have the preamble errata; port 0 of GMII is one */
+static inline bool opip_port_rgmii_preamble(const struct opip_port *p)
+{
+	return p->iface->mode == OPIP_MODE_RGMII ||
+	       (p->iface->mode == OPIP_MODE_GMII && p->index == 0);
+}
+
 /* A port with a PCS: SGMII, QSGMII, or PICMG, which is SGMII to a backplane */
 static inline bool opip_port_has_pcs(const struct opip_port *p)
 {
@@ -400,6 +417,8 @@ void opip_get_gmx_stats(struct net_device *dev, struct opip_gmx_stats *gmx);
 
 /* octeon_pip_link.c */
 int opip_phylink_create(struct opip_port *p);
+void opip_check_preamble_errors(struct net_device *dev);
+struct opip_link opip_port_link(struct opip_port *p);
 
 /* octeon_pip_ethtool.c */
 extern const struct ethtool_ops opip_ethtool_ops;

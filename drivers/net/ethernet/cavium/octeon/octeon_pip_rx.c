@@ -21,6 +21,7 @@
 
 #include "octeon_pip.h"
 #include "octeon_pip_fpa.h"
+#include "octeon_pip_gmx.h"
 #include "octeon_pip_ipd.h"
 #include "octeon_pip_pow.h"
 #include "octeon_pip_rx.h"
@@ -94,6 +95,48 @@ do {									\
 			    port, ##__VA_ARGS__);			\
 } while (0)
 
+/*
+ * With the preamble check off (10 Mbit/s RGMII, see
+ * opip_check_preamble_errors()), a PHY may deliver the preamble in front
+ * of the packet, also shifted by a nibble. Take it off. Only a packet in
+ * one buffer: moving the data of a later one loses the link to the next
+ * segment. The preamble and SFD are eight bytes.
+ *
+ * Return: true if the packet was repaired
+ */
+static bool opip_rx_fix_preamble(struct opip_wqe *wqe)
+{
+	u8 *ptr = opip_virt(opip_buf_addr(wqe->packet_ptr));
+	unsigned int len = opip_wqe_len(wqe);
+	unsigned int i = 0;
+
+	if (opip_wqe_bufs(wqe) != 1 || len < 8 + ETH_HLEN + ETH_FCS_LEN)
+		return false;
+
+	while (i < 7 && *ptr == 0x55) {
+		ptr++;
+		i++;
+	}
+
+	if (*ptr == 0xd5) {
+		wqe->packet_ptr += i + 1;
+		wqe->word1 = u64_replace_bits(wqe->word1, len - i - 5,
+					      OPIP_WQE1_LEN);
+		return true;
+	}
+	if ((*ptr & 0xf) == 0xd) {
+		wqe->packet_ptr += i;
+		len -= i + 4;
+		wqe->word1 = u64_replace_bits(wqe->word1, len, OPIP_WQE1_LEN);
+		for (i = 0; i < len; i++) {
+			*ptr = (*ptr >> 4) | (*(ptr + 1) << 4);
+			ptr++;
+		}
+		return true;
+	}
+	return false;
+}
+
 /* Count a dropped packet whose error the PIP's counters do not have */
 static void opip_rx_count_error(struct net_device *dev, unsigned int err)
 {
@@ -112,7 +155,8 @@ static void opip_rx_count_error(struct net_device *dev, unsigned int err)
 
 /*
  * A packet with a receive error. Minimum size frames with a length error
- * pass: some equipment pads to 64 + 4 FCS instead of 60 + 4.
+ * pass: some equipment pads to 64 + 4 FCS instead of 60 + 4. An alignment
+ * or FCS error with the preamble check off may be a preamble in the data.
  * A frame longer than the port's jabber limit arrives cut there, with the
  * jabber error (GMX_RX_FRM_CHK[JABBER]).
  *
@@ -126,6 +170,30 @@ static noinline __cold bool opip_rx_check_error(struct opip_wqe *wqe,
 
 	if (err == OPIP_RCV_ERR_LENGTH && opip_wqe_len(wqe) <= 64)
 		return false;
+
+	if ((err == OPIP_RCV_ERR_ALIGN || err == OPIP_RCV_ERR_FCS) && dev) {
+		struct opip_port *p = opip_port(dev);
+
+		if (opip_port_rgmii_preamble(p) &&
+		    opip_gmx_preamble_check_off(p->iface->num, p->index)) {
+			/*
+			 * The FCS is not checked, and the PIP parsed the
+			 * preamble: the stack checks the L4 checksum.
+			 */
+			if (opip_rx_fix_preamble(wqe)) {
+				wqe->word2 &= ~OPIP_WQE2_TCP_OR_UDP;
+				/*
+				 * The entry goes back to its pool without a
+				 * barrier: these writes are out first
+				 */
+				wmb();
+				return false;
+			}
+			opip_rx_dbg(dev, port, "unknown preamble, packet dropped\n");
+			opip_rx_free_work(wqe);
+			return true;
+		}
+	}
 
 	opip_rx_dbg(dev, port, "receive error code %u, packet dropped\n", err);
 	opip_rx_count_error(dev, err);

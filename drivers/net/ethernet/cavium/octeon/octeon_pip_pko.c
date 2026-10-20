@@ -268,7 +268,8 @@ void opip_pko_init(struct opip *opip)
  *
  * Every queue gets the same share of the port (priority 8 of 8), none is
  * static but the single queue of a CN68XX port, as the executive sets it,
- * and its FAU counter is reset. Called with the PKO disabled.
+ * and its FAU counter is reset. Called with the PKO disabled, or by the
+ * IPD alignment errata for a queue no port has.
  *
  * Return: 0, or -ENOMEM without a chunk
  */
@@ -316,9 +317,11 @@ int opip_pko_queue_init(struct opip *opip, struct opip_txq *txq, int port,
  * @opip: The complex
  * @txq:  The transmit queue, the PKO done with it
  *
- * The PKO is stopped, or runs with no command of the queue left: a
- * device that failed to register. A queue without a chunk was never
- * given to the PKO: nothing to do.
+ * The PKO is stopped, or runs with no command of the queue left: the IPD
+ * alignment errata and a device that failed to register. Not so for port
+ * 0's device after an errata whose command the PKO kept (the errata
+ * warns): its chunk goes back to the pool with the device. A queue without
+ * a chunk was never given to the PKO: nothing to do.
  */
 void opip_pko_queue_release(struct opip *opip, struct opip_txq *txq)
 {
@@ -520,4 +523,70 @@ void opip_pko_gmx_port_mode(int iface, int num_ports)
 	opip_wr(OPIP_PKO_REG_GMX_PORT_MODE,
 		opip_field_set_var(opip_rd(OPIP_PKO_REG_GMX_PORT_MODE), mask,
 				   mode));
+}
+
+/**
+ * opip_pko_xaui_ports - map the PKO ports of a XAUI interface to its engine
+ * @iface: Interface
+ *
+ * All 16 PKO ports of a XAUI interface go to the one XAUI engine, in
+ * round robin, as the executive does: the 16 are HiGig2's, which the
+ * driver does not support; it uses the first.
+ */
+void opip_pko_xaui_ports(int iface)
+{
+	int i;
+
+	for (i = 0; i < 16; i++)
+		opip_wr(OPIP_PKO_MEM_PORT_PTRS,
+			FIELD_PREP(OPIP_PKO_MEM_PORT_PTRS_QOS_MASK, 0xff) |
+			FIELD_PREP(OPIP_PKO_MEM_PORT_PTRS_EID, iface * 4) |
+			FIELD_PREP(OPIP_PKO_MEM_PORT_PTRS_PID, iface * 16 + i));
+}
+
+/**
+ * opip_pko_queue_qos_disable - take a queue out of the PKO's rounds
+ * @opip:  The complex
+ * @queue: PKO output queue
+ * @port:  PKO port of the queue
+ *
+ * For the RGMII link setup that needs the port idle. Under pko_idx_lock,
+ * as PKO_REG_READ_IDX selects the queue.
+ *
+ * Return: what opip_pko_queue_qos_restore() puts back
+ */
+u64 opip_pko_queue_qos_disable(struct opip *opip, int queue, int port)
+{
+	unsigned long flags;
+	u64 qos;
+
+	spin_lock_irqsave(&opip->pko_idx_lock, flags);
+	opip_wr(OPIP_PKO_REG_READ_IDX,
+		FIELD_PREP(OPIP_PKO_REG_READ_IDX_INDEX, queue));
+	qos = opip_rd(OPIP_PKO_MEM_QUEUE_QOS);
+	qos = u64_replace_bits(qos, port, OPIP_PKO_MEM_QUEUE_QOS_PID);
+	qos = u64_replace_bits(qos, queue, OPIP_PKO_MEM_QUEUE_QOS_QID);
+	opip_wr(OPIP_PKO_MEM_QUEUE_QOS,
+		u64_replace_bits(qos, 0, OPIP_PKO_MEM_QUEUE_QOS_QOS_MASK));
+	spin_unlock_irqrestore(&opip->pko_idx_lock, flags);
+	return qos;
+}
+
+/**
+ * opip_pko_queue_qos_restore - put a queue back into the PKO's rounds
+ * @opip:  The complex
+ * @queue: PKO output queue
+ * @saved: What opip_pko_queue_qos_disable() returned for it
+ *
+ * Under pko_idx_lock, as opip_pko_queue_qos_disable().
+ */
+void opip_pko_queue_qos_restore(struct opip *opip, int queue, u64 saved)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&opip->pko_idx_lock, flags);
+	opip_wr(OPIP_PKO_REG_READ_IDX,
+		FIELD_PREP(OPIP_PKO_REG_READ_IDX_INDEX, queue));
+	opip_wr(OPIP_PKO_MEM_QUEUE_QOS, saved);
+	spin_unlock_irqrestore(&opip->pko_idx_lock, flags);
 }

@@ -36,6 +36,10 @@
  * from half full on a transmit outside of a receive poll reads the counter
  * itself. There is no completion interrupt: a packet that asks for one is
  * a three word command.
+ *
+ * Derived in part from the staging octeon driver (ethernet-tx.c: the
+ * short frame padding of CN3XXX),
+ * Copyright (c) 2003-2018 Cavium, Inc. / Cavium Networks.
  */
 
 #include <linux/atomic.h>
@@ -522,6 +526,16 @@ netdev_features_t opip_features_check(struct sk_buff *skb,
 	return features;
 }
 
+/*
+ * Errata GMX-401 of CN3XXX: the GMX hangs on a collision towards the end
+ * of a frame under 68 bytes. A GMX port in half duplex has p->pad_runts
+ * set (with the link, see opip_link_change()) and pads frames under 64
+ * bytes: an skb with __skb_put_padto(), an XDP packet in its buffer. The
+ * tests sit behind a static key that probe enables on CN3XXX only: on the
+ * other chips each send path runs a nop for it.
+ */
+DEFINE_STATIC_KEY_FALSE(opip_gmx401);
+
 /* Segments of one skb, ignoring its frag_list */
 static unsigned int opip_tx_skb_segs(const struct sk_buff *skb)
 {
@@ -712,10 +726,15 @@ netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	/*
-	 * A frame over the port's limit is dropped: a tc or BPF redirect
-	 * does not check the MTU, and the PKO's lengths are 16 bits
+	 * A frame over the port's limit is dropped (a tc or BPF redirect
+	 * does not check the MTU, and the PKO's lengths are 16 bits); a runt
+	 * is padded on a CN3XXX half duplex port (errata GMX-401; unclones
+	 * and linearizes as needed, the caller frees on error).
 	 */
 	if (unlikely(skb->len > OPIP_MAX_FRAME))
+		goto drop;
+	if (static_branch_unlikely(&opip_gmx401) && skb->len < 64 &&
+	    READ_ONCE(p->pad_runts) && __skb_put_padto(skb, 64, false))
 		goto drop;
 
 	/* The packets sent a batch ago are out: make room before adding */

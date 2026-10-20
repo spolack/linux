@@ -18,6 +18,7 @@
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
@@ -70,6 +71,14 @@ int opip_link_set(struct opip_port *p, const struct opip_link *link)
 	case OPIP_MODE_SGMII:
 	case OPIP_MODE_PICMG:
 		ret = opip_pcs_link_set(iface, p->index, link);
+		break;
+	case OPIP_MODE_RGMII:
+	case OPIP_MODE_GMII:
+		opip_gmx_rgmii_link_set(p->opip, iface, p->index, p->port,
+					link);
+		break;
+	case OPIP_MODE_XAUI:
+		ret = opip_xaui_link_set(iface, p->port, link);
 		break;
 	default:
 		break;
@@ -528,6 +537,8 @@ static void opip_periodic_worker(struct work_struct *work)
 	struct opip_port *p = container_of(work, struct opip_port,
 					   periodic_work.work);
 
+	if (READ_ONCE(p->preamble_polling))
+		opip_check_preamble_errors(p->netdev);
 	opip_poll_errors(p);
 	opip_update_hw_stats(p->netdev);
 
@@ -719,6 +730,9 @@ static int opip_ndo_open(struct net_device *dev)
 	}
 	opip_port_enable(p, true);
 	phylink_start(p->phylink);
+	/* Only then the periodic worker may check for preamble errors */
+	if (opip_port_rgmii_preamble(p))
+		WRITE_ONCE(p->preamble_polling, true);
 	return 0;
 }
 
@@ -732,6 +746,10 @@ static int opip_ndo_stop(struct net_device *dev)
 		opip_tx_stop(dev);
 		return 0;
 	}
+
+	/* No preamble check while the port goes down */
+	WRITE_ONCE(p->preamble_polling, false);
+	flush_delayed_work(&p->periodic_work);
 
 	/* The stack no longer transmits: the PKO sends what it has */
 	opip_tx_drain(dev);
@@ -803,6 +821,134 @@ static struct device_node *opip_port_of_node(struct device_node *pip, int iface,
 	np = opip_of_child(ni, index);
 	of_node_put(ni);
 	return np;
+}
+
+/* The ASX's clock delay steps: 0 to 31 */
+#define OPIP_ASX_CLK_SET_MAX	31
+
+/* A clock delay of an RGMII port from the device tree; -1 if none */
+static int opip_rgmii_delay(struct opip_port *p, const char *prop)
+{
+	u32 val;
+
+	if (!p->of_node || of_property_read_u32(p->of_node, prop, &val))
+		return -1;
+	return min(val, OPIP_ASX_CLK_SET_MAX);
+}
+
+/* Whether a port's node has a phy-mode, valid or not */
+static bool opip_has_phy_mode(const struct device_node *np)
+{
+	return np && (of_property_present(np, "phy-mode") ||
+		      of_property_present(np, "phy-connection-type"));
+}
+
+/*
+ * The PHY mode and the clock delays of an RGMII port. phy-mode says which
+ * side of the link adds the delays: the PHY those of its mode, the board
+ * the others, the MAC none. rx-delay and tx-delay, steps of the ASX, may
+ * fine-tune the MAC's delay on a side the PHY leaves alone. A device
+ * tree without phy-mode (the platform code's and the bootloaders' are
+ * all like that) is read as the staging driver reads it: the MAC adds a
+ * delay that the properties do not set to 0, with the chip's default
+ * step unless they give one, and the PHY the others.
+ *
+ * Return: 0, or -EINVAL if the port cannot run what the node asks for
+ */
+static int opip_rgmii_config(struct opip_port *p)
+{
+	struct device *dev = &p->opip->pdev->dev;
+	int rx = opip_rgmii_delay(p, "rx-delay");
+	int tx = opip_rgmii_delay(p, "tx-delay");
+	struct device_node *np = p->of_node;
+	phy_interface_t mode;
+
+	/* The time a step of the ASX takes is not documented */
+	if (np && (of_property_present(np, "rx-internal-delay-ps") ||
+		   of_property_present(np, "tx-internal-delay-ps"))) {
+		dev_err(dev, "%pOF: rx/tx-internal-delay-ps not supported, the MAC delay is a step of 0 to %d\n",
+			np, OPIP_ASX_CLK_SET_MAX);
+		return -EINVAL;
+	}
+
+	if (!opip_has_phy_mode(np)) {
+		if (rx && tx)
+			p->phy_mode = PHY_INTERFACE_MODE_RGMII;
+		else if (tx)
+			p->phy_mode = PHY_INTERFACE_MODE_RGMII_RXID;
+		else if (rx)
+			p->phy_mode = PHY_INTERFACE_MODE_RGMII_TXID;
+		else
+			p->phy_mode = PHY_INTERFACE_MODE_RGMII_ID;
+		p->rgmii_rx_delay = rx;
+		p->rgmii_tx_delay = tx;
+		dev_warn(dev, "port %d: no phy-mode, taking %s from rx-delay/tx-delay; update the device tree\n",
+			 p->port, phy_modes(p->phy_mode));
+		return 0;
+	}
+
+	if (of_get_phy_mode(np, &mode) || !phy_interface_mode_is_rgmii(mode)) {
+		dev_err(dev, "%pOF: not an RGMII phy-mode on an RGMII port\n",
+			np);
+		return -EINVAL;
+	}
+	p->phy_mode = mode;
+
+	/* Not a delay on a side the PHY adds it on too */
+	if (rx > 0 && (mode == PHY_INTERFACE_MODE_RGMII_ID ||
+		       mode == PHY_INTERFACE_MODE_RGMII_RXID)) {
+		dev_warn(dev, "%pOF: rx-delay %d with phy-mode %s, which delays the receive clock in the PHY: using 0\n",
+			 np, rx, phy_modes(mode));
+		rx = 0;
+	}
+	if (tx > 0 && (mode == PHY_INTERFACE_MODE_RGMII_ID ||
+		       mode == PHY_INTERFACE_MODE_RGMII_TXID)) {
+		dev_warn(dev, "%pOF: tx-delay %d with phy-mode %s, which delays the transmit clock in the PHY: using 0\n",
+			 np, tx, phy_modes(mode));
+		tx = 0;
+	}
+	/* The MAC adds no delay unless the properties tune one */
+	p->rgmii_rx_delay = max(rx, 0);
+	p->rgmii_tx_delay = max(tx, 0);
+	return 0;
+}
+
+/*
+ * Port 0 of CN30XX and CN50XX runs MII when GMX_INF_MODE[P0MII] is set,
+ * on an RGMII and on a GMII interface; the bit is reserved on the other
+ * chips.
+ */
+static bool opip_port_p0mii(const struct opip_port *p)
+{
+	return p->index == 0 && opip_chip->rgmii_mii_clk &&
+	       (opip_rd(OPIP_GMX_INF_MODE(p->iface->num)) &
+		OPIP_GMX_INF_MODE_P0MII);
+}
+
+/*
+ * A GMII or MII port: hw is what the port runs. Port 0 of a GMII
+ * interface is an RGMII port unless P0MII makes it MII. A GMII port runs
+ * MII at 10 and 100 Mbit/s, so "mii" describes one wired to an MII-only
+ * PHY.
+ */
+static int opip_mii_config(struct opip_port *p, phy_interface_t hw)
+{
+	struct device_node *np = p->of_node;
+	phy_interface_t mode;
+
+	p->phy_mode = hw;
+	if (!opip_has_phy_mode(np))
+		return 0;
+	if (of_get_phy_mode(np, &mode) ||
+	    (mode != hw && mode != PHY_INTERFACE_MODE_MII)) {
+		dev_err(&p->opip->pdev->dev, "%pOF: phy-mode not %s%s on a%s port\n",
+			np, phy_modes(hw),
+			hw == PHY_INTERFACE_MODE_GMII ? " or mii" : "",
+			hw == PHY_INTERFACE_MODE_GMII ? " GMII" : "n MII");
+		return -EINVAL;
+	}
+	p->phy_mode = mode;
+	return 0;
 }
 
 /*
@@ -976,12 +1122,28 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	case OPIP_MODE_NPI:
 		name = "npi%d";
 		break;
+	case OPIP_MODE_XAUI:
+		name = "xaui%d";
+		p->phy_mode = PHY_INTERFACE_MODE_XAUI;
+		break;
 	case OPIP_MODE_LOOP:
 		name = "loop%d";
 		break;
 	case OPIP_MODE_SGMII:
 	case OPIP_MODE_PICMG:
 		opip_sgmii_phy_mode(p);
+		break;
+	case OPIP_MODE_GMII:
+	case OPIP_MODE_RGMII:
+		if (opip_port_p0mii(p)) {
+			if (opip_mii_config(p, PHY_INTERFACE_MODE_MII))
+				goto err_put;
+		} else if (iface->mode == OPIP_MODE_GMII && p->index != 0) {
+			if (opip_mii_config(p, PHY_INTERFACE_MODE_GMII))
+				goto err_put;
+		} else if (opip_rgmii_config(p)) {
+			goto err_put;
+		}
 		break;
 	default:
 		goto err_put;
@@ -1103,6 +1265,22 @@ static void opip_probe_ifaces(struct opip *opip)
 			opip_gmx_iface_enable(i);
 			iface->qsgmii = opip_gmx_iface_is_qsgmii(i);
 			break;
+		case OPIP_MODE_XAUI:
+			/*
+			 * HiGig2 makes its 16 logical ports out of a header
+			 * the driver neither parses nor builds: none of them
+			 * would work
+			 */
+			if (opip_rd(OPIP_GMX_HG2_CONTROL(i)) &
+			    OPIP_GMX_HG2_CONTROL_HG2TX_EN) {
+				dev_warn(&opip->pdev->dev,
+					 "interface %d is HiGig2, not supported\n",
+					 i);
+				iface->num_ports = 0;
+				break;
+			}
+			opip_xaui_probe(i);
+			break;
 		case OPIP_MODE_SPI:
 			dev_dbg(&opip->pdev->dev,
 				"interface %d is SPI-4.2, not supported\n", i);
@@ -1129,16 +1307,38 @@ static void opip_probe_ifaces(struct opip *opip)
 /*
  * Bring the ports of an interface up, with the IPD enabled, the PKO not.
  * A failure is reported, not fatal: the ports exist, their links stay
- * down.
+ * down, and the XAUI link setup tries again.
  */
 static void opip_iface_enable(struct opip *opip, struct opip_iface *iface)
 {
 	int index, ret = 0;
 
 	switch (iface->mode) {
+	case OPIP_MODE_RGMII:
+	case OPIP_MODE_GMII:
+		ret = opip_gmx_rgmii_enable(iface->num, iface->num_ports);
+		/* The clock delays of opip_rgmii_config(), over the defaults */
+		for (index = 0; !ret && index < iface->num_ports; index++) {
+			int port = opip_port_number(iface->num, index);
+			struct opip_port *p;
+
+			if (!opip->ports[port])
+				continue;
+			p = opip_port(opip->ports[port]);
+			/* A GMII or MII port keeps the default */
+			if (!phy_interface_mode_is_rgmii(p->phy_mode))
+				continue;
+			opip_gmx_rgmii_set_delays(iface->num, index,
+						  p->rgmii_rx_delay,
+						  p->rgmii_tx_delay);
+		}
+		break;
 	case OPIP_MODE_SGMII:
 	case OPIP_MODE_PICMG:
 		ret = opip_sgmii_enable(iface->num, iface->num_ports);
+		break;
+	case OPIP_MODE_XAUI:
+		ret = opip_xaui_enable(iface->num, iface->first_port);
 		break;
 	case OPIP_MODE_NPI:
 		/* Frames of any length; the host enables the ports */
@@ -1156,6 +1356,188 @@ static void opip_iface_enable(struct opip *opip, struct opip_iface *iface)
 	if (ret)
 		dev_err(&opip->pdev->dev, "interface %d (%s) did not come up: %d\n",
 			iface->num, opip_mode_names[iface->mode], ret);
+}
+
+/* ------------------------------------------------------------------ */
+/* Errata: the IPD pointer alignment of CN30XX and CN31XX pass 1 */
+
+/*
+ * The IPD of these chips starts with its pointer FIFOs misaligned. Send
+ * packets of the right size through port 0 in internal loopback until the
+ * counts line up, and take the packets back from the POW. The packets go
+ * out on the first queue of port 0, the device's own if it has one: the
+ * commands count nothing in the FAU, so its completions are not disturbed.
+ * The polls already run: the packets go to a group none of them serves.
+ */
+static void opip_ipd_ptr_alignment_errata(struct opip *opip)
+{
+	const unsigned int first_payload =
+		OPIP_POOL_PACKET_SIZE - OPIP_BUF_LINK_SIZE - OPIP_FIRST_SKIP;
+	const unsigned int later_payload =
+		OPIP_POOL_PACKET_SIZE - OPIP_BUF_LINK_SIZE - OPIP_LATER_SKIP;
+	u64 prt_cfg, tx_en, rx_en, jabber, frm_max, tag;
+	unsigned int num_segs = 0, pending, core;
+	/* The groups in use are 8 at most */
+	const int group = OPIP_MAX_GROUPS - 1;
+	struct opip_txq *txq, *own = NULL;
+	u64 old_mask;
+	int loop;
+
+	prt_cfg = opip_rd(OPIP_GMX_PRT_CFG(0, 0));
+	tx_en = opip_rd(OPIP_ASX_TX_PRT_EN(0));
+	rx_en = opip_rd(OPIP_ASX_RX_PRT_EN(0));
+	jabber = opip_rd(OPIP_GMX_RX_JABBER(0, 0));
+	frm_max = opip_rd(OPIP_GMX_RX_FRM_MAX(0, 0));
+	tag = opip_rd(OPIP_PIP_PRT_TAG(0));
+	if (!opip_pko_port_valid(opip, 0))
+		return;
+	if (opip->ports[0]) {
+		txq = &opip_port(opip->ports[0])->txq[0];
+	} else {
+		own = kzalloc_obj(*own);
+		if (!own)
+			return;
+		own->queue = opip_pko_base_queue(opip, 0);
+		if (opip_pko_queue_init(opip, own, 0, 0, 1)) {
+			kfree(own);
+			return;
+		}
+		txq = own;
+	}
+
+	opip_gmx_rgmii_loopback(0, 0);
+	opip_wr(OPIP_ASX_RX_PRT_EN(0), 0);
+	msleep(100);
+
+	opip_wr(OPIP_PIP_PRT_TAG(0),
+		u64_replace_bits(tag & ~OPIP_PIP_PRT_TAG_GRPTAG, group,
+				 OPIP_PIP_PRT_TAG_GRP));
+	/* The group mask is the core's own */
+	migrate_disable();
+	core = opip_core();
+	old_mask = opip_pow_select_group(core, group);
+
+	for (loop = 0; loop < 10; loop++) {
+		u64 count = opip_rd(OPIP_IPD_PTR_COUNT);
+		unsigned int wqe_pcnt = FIELD_GET(OPIP_IPD_PTR_COUNT_WQE_PCNT,
+						  count);
+		unsigned int pkt_pcnt = FIELD_GET(OPIP_IPD_PTR_COUNT_PKT_PCNT,
+						  count);
+		unsigned int size, i;
+		struct opip_wqe *wqe;
+		int retry = 100000;
+		u64 *list, *data;
+		void *buf;
+
+		num_segs = (2 + pkt_pcnt - wqe_pcnt) & 3;
+		if (!num_segs)
+			break;
+		num_segs++;
+		size = first_payload + (num_segs - 1) * later_payload -
+		       later_payload / 2;
+
+		opip_wr(OPIP_ASX_PRT_LOOP(0), BIT(0));
+		mb();	/* the loopback is on before the packet is sent */
+
+		list = opip_fpa_alloc(OPIP_POOL_WQE);
+		buf = opip_fpa_alloc(OPIP_POOL_PACKET);
+		if (!list || !buf) {
+			dev_warn(&opip->pdev->dev, "no buffer for the IPD alignment errata\n");
+			if (list)
+				opip_fpa_free(list, OPIP_POOL_WQE, 0);
+			if (buf)
+				opip_fpa_free(buf, OPIP_POOL_PACKET, 0);
+			break;
+		}
+
+		/*
+		 * An IP packet of the size, in one buffer the PKO reads in
+		 * segments
+		 */
+		data = buf;
+		data[0] = 0xffffffffffff0000ull;
+		data[1] = 0x08004510ull;
+		data[2] = ((u64)(size - 14) << 48) | 0x5ae740004000ull;
+		data[3] = 0x3a5fc0a81073c0a8ull;
+		for (i = 0; i < num_segs; i++)
+			list[i] = opip_buf_build(opip_phys(buf),
+						 i ? later_payload :
+						     first_payload,
+						 OPIP_POOL_PACKET, 0,
+						 i != num_segs - 1);
+
+		opip_gmx_port_enable(0, 0, true, 0);
+		opip_wr(OPIP_ASX_TX_PRT_EN(0), BIT(0));
+		opip_wr(OPIP_ASX_RX_PRT_EN(0), BIT(0));
+		opip_wr(OPIP_GMX_RX_JABBER(0, 0), OPIP_MAX_FRAME - 14 - 4);
+		opip_wr(OPIP_GMX_RX_FRM_MAX(0, 0), OPIP_MAX_FRAME - 14 - 4);
+
+		if (!opip_pko_write(txq,
+				    FIELD_PREP(OPIP_PKO_CMD_SEGS, num_segs) |
+				    FIELD_PREP(OPIP_PKO_CMD_TOTAL_BYTES, size) |
+				    OPIP_PKO_CMD_GATHER,
+				    opip_buf_build(opip_phys(list), num_segs,
+						   OPIP_POOL_WQE, 0, false))) {
+			dev_warn(&opip->pdev->dev, "no command chunk for the IPD alignment errata\n");
+			opip_fpa_free(list, OPIP_POOL_WQE, 0);
+			opip_fpa_free(buf, OPIP_POOL_PACKET, 0);
+			break;
+		}
+		opip_pko_doorbell(0, txq->queue, 2);
+		/* the doorbell is written before the work is requested */
+		mb();
+
+		do {
+			wqe = opip_pow_request_sync(true);
+		} while (!wqe && --retry);
+		if (!wqe) {
+			dev_warn(&opip->pdev->dev, "IPD alignment errata: no work came back\n");
+		} else {
+			/* As a poll would */
+			opip_ipd_bp_sub(0, opip_wqe_bufs(wqe));
+			opip_rx_free_work(wqe);
+		}
+	}
+
+	/* Work that did not come back may leave the command in the PKO */
+	read_poll_timeout(opip_pko_queue_pending, pending, !pending, 200,
+			  20 * USEC_PER_MSEC, false, opip, txq->queue);
+	/*
+	 * What comes in from now on goes to a served group; a frame still
+	 * on its way through the loopback and what came in late are in no
+	 * served group: take them back.
+	 */
+	opip_wr(OPIP_PIP_PRT_TAG(0), tag);
+	usleep_range(200, 400);
+	for (;;) {
+		struct opip_wqe *wqe = opip_pow_request_sync(false);
+
+		if (!wqe)
+			break;
+		opip_ipd_bp_sub(0, opip_wqe_bufs(wqe));
+		opip_rx_free_work(wqe);
+	}
+	opip_pow_restore_groups(core, old_mask);
+	migrate_enable();
+
+	opip_wr(OPIP_GMX_PRT_CFG(0, 0), prt_cfg);
+	opip_wr(OPIP_ASX_TX_PRT_EN(0), tx_en);
+	opip_wr(OPIP_ASX_RX_PRT_EN(0), rx_en);
+	opip_wr(OPIP_GMX_RX_JABBER(0, 0), jabber);
+	opip_wr(OPIP_GMX_RX_FRM_MAX(0, 0), frm_max);
+	opip_wr(OPIP_ASX_PRT_LOOP(0), 0);
+	mb();	/* the registers are restored before the port is used */
+	if (num_segs)
+		dev_warn(&opip->pdev->dev, "the IPD pointer alignment errata workaround failed\n");
+	if (pending)
+		dev_warn(&opip->pdev->dev, "IPD alignment errata: the PKO holds %u command words of queue %d\n",
+			 pending, txq->queue);
+	if (own) {
+		/* A chunk the PKO may still read is kept, not reused */
+		if (!pending)
+			opip_pko_queue_release(opip, own);
+		kfree(own);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1492,8 +1874,8 @@ static int opip_hw_init(struct opip *opip)
 }
 
 /*
- * The interface bring-up enables the MAC of every SGMII and PICMG
- * port. A port without a device has nobody to take its
+ * The interface bring-up enables the MAC of every RGMII, GMII, SGMII,
+ * PICMG and XAUI port. A port without a device has nobody to take its
  * packets: off again.
  */
 static void opip_iface_disable_unused(struct opip *opip,
@@ -1502,9 +1884,18 @@ static void opip_iface_disable_unused(struct opip *opip,
 	int index;
 
 	switch (iface->mode) {
+	case OPIP_MODE_RGMII:
+	case OPIP_MODE_GMII:
 	case OPIP_MODE_SGMII:
 	case OPIP_MODE_PICMG:
 		break;
+	case OPIP_MODE_XAUI:
+		/* One MAC for the interface: off if its port has no device */
+		for (index = 0; index < iface->num_ports; index++)
+			if (opip->ports[opip_port_number(iface->num, index)])
+				return;
+		opip_gmx_port_enable(iface->num, 0, false, 0);
+		return;
 	default:
 		return;
 	}
@@ -1526,6 +1917,10 @@ static void opip_input_enable(struct opip *opip)
 		opip_iface_disable_unused(opip, &opip->ifaces[i]);
 	}
 	opip_pko_enable();
+
+	if ((OCTEON_IS_MODEL(OCTEON_CN31XX_PASS1) ||
+	     OCTEON_IS_MODEL(OCTEON_CN30XX_PASS1)) && !opip_on_simulator())
+		opip_ipd_ptr_alignment_errata(opip);
 }
 
 /*
@@ -1760,6 +2155,9 @@ static int opip_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "CN38XX pass 1 and 2 are not supported\n");
 		return -ENODEV;
 	}
+	/* Errata GMX-401: the runt padding, only here */
+	if (opip_chip->cn3xxx)
+		static_branch_enable(&opip_gmx401);
 
 	/*
 	 * Not devm_kzalloc(): the devres header in front of it would leave

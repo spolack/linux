@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/lockdep.h>
 #include <linux/string.h>
 
 #include "octeon_pip.h"
@@ -243,16 +244,28 @@ int opip_gmx_wait_idle(int iface, int index)
  * opip_gmx_set_speed - program a port's MAC for a link's speed and duplex
  * @iface: Interface
  * @index: Port on it
- * @link:  The link; a down link keeps the speed and the duplex
+ * @link:  The link; a down link keeps the speed, RGMII forces full duplex
+ * @rgmii: An RGMII/GMII port, which has the transmit clock divider too
  *
- * The caller has the port disabled.
+ * The caller has the port disabled, or does not care (RGMII, where the
+ * interface is held off through the PKO queues and the ASX enables).
  */
-void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
+void opip_gmx_set_speed(int iface, int index, const struct opip_link *link,
+			bool rgmii)
 {
 	u64 cfg = opip_rd(OPIP_GMX_PRT_CFG(iface, index));
 	unsigned int speed = link->speed;
 
-	if (link->up) {
+	if (rgmii) {
+		/* A down link runs full duplex */
+		if (!link->up || link->full_duplex)
+			cfg |= OPIP_GMX_PRT_CFG_DUPLEX;
+		else
+			cfg &= ~OPIP_GMX_PRT_CFG_DUPLEX;
+		/* Anything unknown runs as 1 Gbit/s */
+		if (speed != 10 && speed != 100)
+			speed = 1000;
+	} else if (link->up) {
 		if (link->full_duplex)
 			cfg |= OPIP_GMX_PRT_CFG_DUPLEX;
 		else
@@ -262,11 +275,16 @@ void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
 	switch (speed) {
 	case 10:
 		cfg &= ~(OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME);
-		cfg |= OPIP_GMX_PRT_CFG_SPEED_MSB;
+		/* SPEED_MSB is reserved on the RGMII chips */
+		if (!rgmii)
+			cfg |= OPIP_GMX_PRT_CFG_SPEED_MSB;
 		opip_wr(OPIP_GMX_TX_SLOT(iface, index),
 			OPIP_GMX_TX_SLOT_10_100);
 		opip_wr(OPIP_GMX_TX_BURST(iface, index),
 			OPIP_GMX_TX_BURST_10_100);
+		if (rgmii)
+			opip_wr(OPIP_GMX_TX_CLK(iface, index),
+				OPIP_GMX_TX_CLK_10);
 		break;
 	case 100:
 		cfg &= ~(OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME |
@@ -275,6 +293,9 @@ void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
 			OPIP_GMX_TX_SLOT_10_100);
 		opip_wr(OPIP_GMX_TX_BURST(iface, index),
 			OPIP_GMX_TX_BURST_10_100);
+		if (rgmii)
+			opip_wr(OPIP_GMX_TX_CLK(iface, index),
+				OPIP_GMX_TX_CLK_100);
 		break;
 	case 1000:
 		cfg |= OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME;
@@ -282,11 +303,28 @@ void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
 		opip_wr(OPIP_GMX_TX_SLOT(iface, index), OPIP_GMX_TX_SLOT_1000);
 		opip_wr(OPIP_GMX_TX_BURST(iface, index),
 			OPIP_GMX_TX_BURST_1000);
+		if (rgmii)
+			opip_wr(OPIP_GMX_TX_CLK(iface, index),
+				OPIP_GMX_TX_CLK_1000);
 		break;
 	default:
 		break;
 	}
 
+	/* RGMII on the small chips: MII ports run with CLK_CNT = 1 */
+	if (rgmii && (speed == 10 || speed == 100) &&
+	    opip_chip->rgmii_mii_clk) {
+		u64 mode = opip_rd(OPIP_GMX_INF_MODE(iface));
+
+		if ((index == 0 && (mode & OPIP_GMX_INF_MODE_P0MII)) ||
+		    (index != 0 && (mode & OPIP_GMX_INF_MODE_TYPE)))
+			opip_wr(OPIP_GMX_TX_CLK(iface, index),
+				OPIP_GMX_TX_CLK_1000);
+	}
+
+	/* RGMII: the speed bits are written when the port is disabled */
+	if (rgmii)
+		opip_rd(OPIP_GMX_PRT_CFG(iface, index));
 	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg);
 	opip_rd(OPIP_GMX_PRT_CFG(iface, index));
 }
@@ -434,4 +472,256 @@ unsigned int opip_gmx_poll_errors(int iface, int index, bool nxa)
 	if (clr)
 		opip_wr(OPIP_GMX_TX_INT_REG(iface), clr);
 	return errors;
+}
+
+/**
+ * opip_gmx_preamble_check_off - whether a port's preamble check is off
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Return: true if GMX_RX_FRM_CTL[PRE_CHK] is clear: the receive path has
+ * the preamble to remove
+ */
+bool opip_gmx_preamble_check_off(int iface, int index)
+{
+	return !(opip_rd(OPIP_GMX_RX_FRM_CTL(iface, index)) &
+		 OPIP_GMX_RX_FRM_CTL_PRE_CHK);
+}
+
+/**
+ * opip_gmx_set_preamble_check - turn a port's preamble check on or off
+ * @iface:  Interface
+ * @index:  Port on it
+ * @enable: Check the preamble
+ *
+ * The preamble check of a port, and its preamble error bit cleared with
+ * it. The other bits stay for opip_gmx_poll_errors().
+ */
+void opip_gmx_set_preamble_check(int iface, int index, bool enable)
+{
+	u64 ctl = opip_rd(OPIP_GMX_RX_FRM_CTL(iface, index));
+
+	if (enable)
+		ctl |= OPIP_GMX_RX_FRM_CTL_PRE_CHK;
+	else
+		ctl &= ~OPIP_GMX_RX_FRM_CTL_PRE_CHK;
+	opip_wr(OPIP_GMX_RX_FRM_CTL(iface, index), ctl);
+	opip_wr(OPIP_GMX_RX_INT_REG(iface, index), OPIP_GMX_RX_INT_PCTERR);
+}
+
+/**
+ * opip_gmx_preamble_errors - whether a port saw preamble errors
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Return: true if the port saw preamble errors since the bit was last
+ * cleared
+ */
+bool opip_gmx_preamble_errors(int iface, int index)
+{
+	return opip_rd(OPIP_GMX_RX_INT_REG(iface, index)) &
+	       OPIP_GMX_RX_INT_PCTERR;
+}
+
+/* ------------------------------------------------------------------ */
+/* RGMII and GMII ports, with their ASX pads */
+
+/**
+ * opip_gmx_rgmii_enable - bring up the RGMII/GMII ports of an interface
+ * @iface:     Interface
+ * @num_ports: Ports on it
+ *
+ * The ASX enables, the flexible preamble check, the PAUSE timings, the
+ * clock delays, then the ports enabled.
+ *
+ * Return: 0, -ENODEV if the interface is not an enabled RGMII one, or
+ * the error of opip_gmx_setup()
+ */
+int opip_gmx_rgmii_enable(int iface, int num_ports)
+{
+	u64 mode = opip_rd(OPIP_GMX_INF_MODE(iface));
+	int index, ret;
+
+	if (!(mode & OPIP_GMX_INF_MODE_EN))
+		return -ENODEV;
+	/*
+	 * An SPI-4.2 interface of CN38XX or CN58XX, which the driver leaves
+	 * alone
+	 */
+	if (opip_chip->spi && (mode & OPIP_GMX_INF_MODE_TYPE))
+		return -ENODEV;
+
+	opip_wr(OPIP_ASX_TX_PRT_EN(iface), GENMASK(num_ports - 1, 0));
+	opip_wr(OPIP_ASX_RX_PRT_EN(iface), GENMASK(num_ports - 1, 0));
+
+	for (index = 0; index < num_ports; index++) {
+		opip_wr(OPIP_GMX_RX_FRM_CTL(iface, index),
+			opip_rd(OPIP_GMX_RX_FRM_CTL(iface, index)) |
+			OPIP_GMX_RX_FRM_CTL_PRE_FREE);
+		/*
+		 * A PAUSE frame asks for about 10M bit times; an XON frame
+		 * restarts the flow if room comes free before that.
+		 */
+		opip_wr(OPIP_GMX_TX_PAUSE_PKT_TIME(iface, index),
+			OPIP_GMX_TX_PAUSE_TIME);
+		opip_wr(OPIP_GMX_TX_PAUSE_PKT_INTERVAL(iface, index),
+			OPIP_GMX_TX_PAUSE_INTERVAL);
+		opip_gmx_rgmii_set_delays(iface, index, opip_chip->rgmii_delay,
+					  opip_chip->rgmii_delay);
+	}
+
+	ret = opip_gmx_setup(iface, num_ports);
+	if (ret)
+		return ret;
+
+	for (index = 0; index < num_ports; index++)
+		opip_gmx_port_enable(iface, index, true, 0);
+	return 0;
+}
+
+/**
+ * opip_gmx_rgmii_link - the link state of an RGMII port without a PHY
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * What the other end signals in band, as the executive's board code reads
+ * it: the RGMII in-band status on the chips with RGMII, down on the others,
+ * which have none. 1 Gbit/s in internal loopback and on the simulator.
+ *
+ * Return: the link of the port
+ */
+struct opip_link opip_gmx_rgmii_link(int iface, int index)
+{
+	static const unsigned int speeds[] = { 10, 100, 1000 };
+	struct opip_link link = { };
+	unsigned int speed;
+	u64 inbnd;
+
+	if (opip_on_simulator() ||
+	    FIELD_GET(OPIP_ASX_PRT_LOOP_INT_LOOP,
+		      opip_rd(OPIP_ASX_PRT_LOOP(iface))) & BIT(index))
+		return (struct opip_link){ .up = true, .full_duplex = true,
+					   .speed = 1000 };
+	if (!opip_chip->rgmii_ports)
+		return link;
+	inbnd = opip_rd(OPIP_GMX_RX_INBND(iface, index));
+	speed = FIELD_GET(OPIP_GMX_RX_INBND_SPEED, inbnd);
+	/* Speed 3 is reserved */
+	if (!(inbnd & OPIP_GMX_RX_INBND_STATUS) || speed >= ARRAY_SIZE(speeds))
+		return link;
+	link.up = true;
+	link.full_duplex = inbnd & OPIP_GMX_RX_INBND_DUPLEX;
+	link.speed = speeds[speed];
+	return link;
+}
+
+/**
+ * opip_gmx_rgmii_link_set - set an RGMII/GMII port up for a link
+ * @opip:  The complex
+ * @iface: Interface
+ * @index: Port on it
+ * @port:  Its IPD/PKO port
+ * @link:  The link state
+ *
+ * The port is taken off the line first: the ASX receive enable, the PKO
+ * queues of the port (through PKO_REG_READ_IDX), backpressure
+ * overridden, then the GMX state machines are polled idle through the
+ * debug port. Not on the simulator. The caller holds hw_lock. A GMX that
+ * does not go idle gets the speed anyway.
+ */
+void opip_gmx_rgmii_link_set(struct opip *opip, int iface, int index, int port,
+			     const struct opip_link *link)
+{
+	int base = opip_pko_base_queue(opip, port);
+	int num = opip_pko_num_queues(opip, port);
+	u64 qos[OPIP_MAX_TXQS];
+	u64 cfg, ovr, dbg;
+	int i;
+
+	lockdep_assert_held(&opip->hw_lock);
+	if (opip_on_simulator())
+		return;
+
+	cfg = opip_rd(OPIP_GMX_PRT_CFG(iface, index));
+
+	opip_wr(OPIP_ASX_RX_PRT_EN(iface),
+		opip_rd(OPIP_ASX_RX_PRT_EN(iface)) & ~BIT(index));
+	for (i = 0; i < num; i++)
+		qos[i] = opip_pko_queue_qos_disable(opip, base + i, port);
+
+	ovr = opip_rd(OPIP_GMX_TX_OVR_BP(iface));
+	opip_wr(OPIP_GMX_TX_OVR_BP(iface),
+		(ovr & ~FIELD_PREP(OPIP_GMX_TX_OVR_BP_BP, BIT(index))) |
+		FIELD_PREP(OPIP_GMX_TX_OVR_BP_EN, BIT(index)));
+	opip_rd(OPIP_GMX_TX_OVR_BP(iface));
+
+	/*
+	 * Wait for the GMX state machine to go idle. If it does not, the
+	 * speed changes anyway, with a slight chance of a GMX lockup.
+	 */
+	opip_wr(OPIP_NPI_DBG_SELECT, OPIP_NPI_DBG_SELECT_GMX(iface, index));
+	read_poll_timeout(opip_rd, dbg,
+			  !(FIELD_GET(OPIP_DBG_DATA_DATA, dbg) & 7),
+			  10, 10000, false, OPIP_DBG_DATA);
+	read_poll_timeout(opip_rd, dbg,
+			  !(FIELD_GET(OPIP_DBG_DATA_DATA, dbg) & 0xf),
+			  10, 10000, false, OPIP_DBG_DATA);
+
+	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg & ~OPIP_GMX_PRT_CFG_EN);
+	opip_rd(OPIP_GMX_PRT_CFG(iface, index));
+
+	opip_gmx_set_speed(iface, index, link, true);
+
+	opip_wr(OPIP_ASX_RX_PRT_EN(iface),
+		opip_rd(OPIP_ASX_RX_PRT_EN(iface)) | BIT(index));
+	for (i = 0; i < num; i++)
+		opip_pko_queue_qos_restore(opip, base + i, qos[i]);
+	opip_wr(OPIP_GMX_TX_OVR_BP(iface), ovr);
+
+	/* The enable state is as it was */
+	opip_wr(OPIP_GMX_PRT_CFG(iface, index),
+		(opip_rd(OPIP_GMX_PRT_CFG(iface, index)) &
+		 ~OPIP_GMX_PRT_CFG_EN) |
+		(cfg & OPIP_GMX_PRT_CFG_EN));
+}
+
+/**
+ * opip_gmx_rgmii_set_delays - set the clock delays of an RGMII port's pads
+ * @iface: Interface
+ * @index: Port on it
+ * @rx:    ASX_RX_CLK_SET, in steps of the ASX; negative leaves it as it is
+ * @tx:    ASX_TX_CLK_SET, in steps of the ASX; negative leaves it as it is
+ */
+void opip_gmx_rgmii_set_delays(int iface, int index, int rx, int tx)
+{
+	if (rx >= 0)
+		opip_wr(OPIP_ASX_RX_CLK_SET(iface, index), rx);
+	if (tx >= 0)
+		opip_wr(OPIP_ASX_TX_CLK_SET(iface, index), tx);
+}
+
+/**
+ * opip_gmx_rgmii_loopback - put an RGMII port into internal loopback
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Put an RGMII port into internal loopback at 1 Gbit/s full duplex, for
+ * the IPD pointer alignment errata of CN3XXX pass 1.
+ */
+void opip_gmx_rgmii_loopback(int iface, int index)
+{
+	u64 cfg = OPIP_GMX_PRT_CFG_DUPLEX | OPIP_GMX_PRT_CFG_SLOTTIME |
+		  OPIP_GMX_PRT_CFG_SPEED;
+
+	opip_wr(OPIP_GMX_TX_CLK(iface, index), OPIP_GMX_TX_CLK_1000);
+	opip_wr(OPIP_GMX_TX_SLOT(iface, index), OPIP_GMX_TX_SLOT_1000);
+	opip_wr(OPIP_GMX_TX_BURST(iface, index), OPIP_GMX_TX_BURST_1000);
+	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg);
+	opip_wr(OPIP_ASX_PRT_LOOP(iface),
+		opip_rd(OPIP_ASX_PRT_LOOP(iface)) | BIT(index));
+	opip_wr(OPIP_ASX_TX_PRT_EN(iface),
+		opip_rd(OPIP_ASX_TX_PRT_EN(iface)) | BIT(index));
+	opip_wr(OPIP_ASX_RX_PRT_EN(iface),
+		opip_rd(OPIP_ASX_RX_PRT_EN(iface)) | BIT(index));
+	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg | OPIP_GMX_PRT_CFG_EN);
 }

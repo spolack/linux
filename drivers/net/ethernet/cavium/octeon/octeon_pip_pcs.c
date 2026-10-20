@@ -18,6 +18,7 @@
 #include "octeon_pip.h"
 #include "octeon_pip_gmx.h"
 #include "octeon_pip_pcs.h"
+#include "octeon_pip_pko.h"
 #include "octeon_pip_regs.h"
 
 /* ------------------------------------------------------------------ */
@@ -418,7 +419,7 @@ int opip_pcs_link_set(int iface, int index, const struct opip_link *link)
 
 	if (enabled < 0)
 		return enabled;
-	opip_gmx_set_speed(iface, index, link);
+	opip_gmx_set_speed(iface, index, link, false);
 	misc = opip_rd(OPIP_PCS_MISC_CTL(iface, index));
 	if (link->up)
 		misc &= ~OPIP_PCS_MISC_CTL_GMXENO;
@@ -568,4 +569,167 @@ unsigned int opip_pcs_poll_errors(int iface, int index)
 	if (clr)
 		opip_wr(OPIP_PCS_INT_REG(iface, index), clr);
 	return errors;
+}
+
+/* ------------------------------------------------------------------ */
+/* XAUI */
+
+/**
+ * opip_xaui_probe - the probe time setup of a XAUI interface
+ * @iface: Interface
+ *
+ * Enable the interface (errata GMX-700), one GMX port, 16 PKO ports.
+ */
+void opip_xaui_probe(int iface)
+{
+	opip_gmx_iface_enable(iface);
+	opip_gmx_setup(iface, 1);
+	opip_pko_xaui_ports(iface);
+}
+
+/**
+ * opip_xaui_enable - bring up a XAUI interface
+ * @iface: Interface
+ * @port:  The IPD/PKO port of its one port, the port kind on CN68XX
+ *
+ * The sequence of the manual: GMX held off, interrupts off, the
+ * reconciliation layer, the PCS reset (hangs CN66XX and CN68XX pass 1
+ * and 2, skipped there), the GMX configured idle for 10 Gbit/s, the
+ * errors cleared, the link waited for, and the port enabled.
+ *
+ * Return: 0, or -ETIMEDOUT at the step that did not complete
+ */
+int opip_xaui_enable(int iface, int port)
+{
+	u64 rx_int_en, tx_int_en, pcs_int_en, ctl, st;
+
+	if (opip_chip->cn68xx)
+		opip_wr(OPIP_GMX_PRT_CFG(iface, 0),
+			u64_replace_bits(opip_rd(OPIP_GMX_PRT_CFG(iface, 0)),
+					 port, OPIP_GMX_PRT_CFG_PKND));
+
+	opip_wr(OPIP_PCSX_MISC_CTL(iface),
+		opip_rd(OPIP_PCSX_MISC_CTL(iface)) | OPIP_PCSX_MISC_CTL_GMXENO);
+
+	rx_int_en = opip_rd(OPIP_GMX_RX_INT_EN(iface, 0));
+	opip_wr(OPIP_GMX_RX_INT_EN(iface, 0), 0);
+	tx_int_en = opip_rd(OPIP_GMX_TX_INT_EN(iface));
+	opip_wr(OPIP_GMX_TX_INT_EN(iface), 0);
+	pcs_int_en = opip_rd(OPIP_PCSX_INT_EN(iface));
+	opip_wr(OPIP_PCSX_INT_EN(iface), 0);
+
+	/* Deficit idle count: better inter-frame gap packing */
+	ctl = opip_rd(OPIP_GMX_TX_XAUI_CTL(iface));
+	ctl |= OPIP_GMX_TX_XAUI_CTL_DIC_EN;
+	ctl &= ~OPIP_GMX_TX_XAUI_CTL_UNI_EN;
+	opip_wr(OPIP_GMX_TX_XAUI_CTL(iface), ctl);
+
+	ctl = opip_rd(OPIP_PCSX_CONTROL1(iface)) & ~OPIP_PCSX_CONTROL1_LO_PWR;
+	if (!OCTEON_IS_MODEL(OCTEON_CN66XX) &&
+	    !OCTEON_IS_MODEL(OCTEON_CN68XX_PASS1_X) &&
+	    !OCTEON_IS_MODEL(OCTEON_CN68XX_PASS2_X))
+		ctl |= OPIP_PCSX_CONTROL1_RESET;
+	opip_wr(OPIP_PCSX_CONTROL1(iface), ctl);
+
+	if (read_poll_timeout(opip_rd, st, !(st & OPIP_PCSX_CONTROL1_RESET),
+			      10, 10000, false, OPIP_PCSX_CONTROL1(iface)))
+		return -ETIMEDOUT;
+	if (read_poll_timeout(opip_rd, st, st & OPIP_PCSX_10GBX_STATUS_ALIGND,
+			      10, 10000, false, OPIP_PCSX_10GBX_STATUS(iface)))
+		return -ETIMEDOUT;
+	if (read_poll_timeout(opip_rd, st,
+			      !FIELD_GET(OPIP_GMX_RX_XAUI_CTL_STATUS, st),
+			      10, 10000, false, OPIP_GMX_RX_XAUI_CTL(iface)))
+		return -ETIMEDOUT;
+
+	opip_gmx_port_enable(iface, 0, false, 0);
+	if (opip_gmx_wait_idle(iface, 0))
+		return -ETIMEDOUT;
+
+	ctl = opip_rd(OPIP_GMX_PRT_CFG(iface, 0));
+	ctl |= OPIP_GMX_PRT_CFG_SPEED | OPIP_GMX_PRT_CFG_SLOTTIME;
+	ctl &= ~OPIP_GMX_PRT_CFG_SPEED_MSB;
+	opip_wr(OPIP_GMX_TX_PRTS(iface), 1);
+	opip_wr(OPIP_GMX_TX_SLOT(iface, 0), OPIP_GMX_TX_SLOT_1000);
+	opip_wr(OPIP_GMX_TX_BURST(iface, 0), OPIP_GMX_TX_BURST_1000);
+	opip_wr(OPIP_GMX_PRT_CFG(iface, 0), ctl);
+
+	opip_wr(OPIP_GMX_RX_INT_REG(iface, 0),
+		opip_rd(OPIP_GMX_RX_INT_REG(iface, 0)));
+	opip_wr(OPIP_GMX_TX_INT_REG(iface),
+		opip_rd(OPIP_GMX_TX_INT_REG(iface)));
+	opip_wr(OPIP_PCSX_INT_REG(iface), opip_rd(OPIP_PCSX_INT_REG(iface)));
+
+	if (read_poll_timeout(opip_rd, st, st & OPIP_PCSX_STATUS1_RCV_LNK,
+			      10, 10000, false, OPIP_PCSX_STATUS1(iface)))
+		return -ETIMEDOUT;
+	if (read_poll_timeout(opip_rd, st, !(st & OPIP_PCSX_STATUS2_XMTFLT),
+			      10, 10000, false, OPIP_PCSX_STATUS2(iface)))
+		return -ETIMEDOUT;
+	if (read_poll_timeout(opip_rd, st, !(st & OPIP_PCSX_STATUS2_RCVFLT),
+			      10, 10000, false, OPIP_PCSX_STATUS2(iface)))
+		return -ETIMEDOUT;
+
+	opip_wr(OPIP_GMX_RX_INT_EN(iface, 0), rx_int_en);
+	opip_wr(OPIP_GMX_TX_INT_EN(iface), tx_int_en);
+	opip_wr(OPIP_PCSX_INT_EN(iface), pcs_int_en);
+
+	opip_wr(OPIP_PCSX_MISC_CTL(iface),
+		opip_rd(OPIP_PCSX_MISC_CTL(iface)) &
+		~OPIP_PCSX_MISC_CTL_GMXENO);
+	opip_gmx_port_enable(iface, 0, true, port);
+	return 0;
+}
+
+/**
+ * opip_xaui_link - the link state of a XAUI interface
+ * @iface: Interface
+ *
+ * Up only with both sides of the GMX happy and the PCS receiving. A down
+ * link turns the GMX and PCS interrupts off.
+ *
+ * Return: the link state, 10 Gbit/s full duplex when up
+ */
+struct opip_link opip_xaui_link(int iface)
+{
+	struct opip_link link = { };
+
+	if (!FIELD_GET(OPIP_GMX_TX_XAUI_CTL_LS,
+		       opip_rd(OPIP_GMX_TX_XAUI_CTL(iface))) &&
+	    !FIELD_GET(OPIP_GMX_RX_XAUI_CTL_STATUS,
+		       opip_rd(OPIP_GMX_RX_XAUI_CTL(iface))) &&
+	    (opip_rd(OPIP_PCSX_STATUS1(iface)) & OPIP_PCSX_STATUS1_RCV_LNK)) {
+		link.up = true;
+		link.full_duplex = true;
+		link.speed = 10000;
+	} else {
+		opip_wr(OPIP_GMX_RX_INT_EN(iface, 0), 0);
+		opip_wr(OPIP_GMX_TX_INT_EN(iface), 0);
+		opip_wr(OPIP_PCSX_INT_EN(iface), 0);
+	}
+	return link;
+}
+
+/**
+ * opip_xaui_link_set - set a XAUI interface up for a link
+ * @iface: Interface
+ * @port:  The IPD/PKO port of its one port, for opip_xaui_enable()
+ * @link:  The link state
+ *
+ * A link that should be up and is not, or an interface whose bring-up did
+ * not complete (GMXENO still set), gets the interface brought up again.
+ *
+ * Return: 0, or the error of opip_xaui_enable()
+ */
+int opip_xaui_link_set(int iface, int port, const struct opip_link *link)
+{
+	if (!link->up)
+		return 0;
+	if (!FIELD_GET(OPIP_GMX_TX_XAUI_CTL_LS,
+		       opip_rd(OPIP_GMX_TX_XAUI_CTL(iface))) &&
+	    !FIELD_GET(OPIP_GMX_RX_XAUI_CTL_STATUS,
+		       opip_rd(OPIP_GMX_RX_XAUI_CTL(iface))) &&
+	    !(opip_rd(OPIP_PCSX_MISC_CTL(iface)) & OPIP_PCSX_MISC_CTL_GMXENO))
+		return 0;
+	return opip_xaui_enable(iface, port);
 }

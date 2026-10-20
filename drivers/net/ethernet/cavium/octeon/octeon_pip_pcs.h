@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * The SGMII/QSGMII PCS of a port.
+ * The SGMII/QSGMII PCS of a port, and the XAUI PCS of an interface.
  *
  * Derived in part from the Cavium executive (arch/mips/cavium-octeon/
  * executive/cvmx-helper-sgmii.c, cvmx-helper-xaui.c),
@@ -29,5 +29,10 @@ int opip_pcs_link_up(int iface, int index, const struct opip_link *link,
 		     bool inband);
 int opip_pcs_link_set(int iface, int index, const struct opip_link *link);
 unsigned int opip_pcs_poll_errors(int iface, int index);
+
+void opip_xaui_probe(int iface);
+int opip_xaui_enable(int iface, int port);
+struct opip_link opip_xaui_link(int iface);
+int opip_xaui_link_set(int iface, int port, const struct opip_link *link);
 
 #endif /* OCTEON_PIP_PCS_H */

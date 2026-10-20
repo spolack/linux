@@ -5,12 +5,15 @@
 #ifndef OCTEON_PIP_TX_H
 #define OCTEON_PIP_TX_H
 
+#include <linux/jump_label.h>
 #include <linux/netdevice.h>
 
 #include "octeon_pip.h"
 
 /* Gather list entries a WQE pool buffer holds, for skbs and XDP frames */
 #define OPIP_TX_MAX_SEGS	(OPIP_POOL_WQE_SIZE / sizeof(u64))
+
+DECLARE_STATIC_KEY_FALSE(opip_gmx401);
 
 netdev_tx_t opip_xmit(struct sk_buff *skb, struct net_device *dev);
 void opip_tx_poll_begin(struct opip_tx_poll *poll, int budget);

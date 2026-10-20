@@ -40,11 +40,21 @@ void opip_gmx_port_enable(int iface, int index, bool en, int pknd);
 void opip_gmx_set_mac(int iface, int index, const u8 *addr);
 void opip_gmx_set_rx_filter(int iface, int index, bool promisc, bool allmulti);
 void opip_gmx_set_frame_max(int iface, int index, unsigned int max_frame);
-void opip_gmx_set_speed(int iface, int index, const struct opip_link *link);
+void opip_gmx_set_speed(int iface, int index, const struct opip_link *link,
+			bool rgmii);
 int opip_gmx_wait_idle(int iface, int index);
 void opip_gmx_bp_state(int iface, int num_ports, struct opip_gmx_bp *s);
 unsigned int opip_gmx_poll_errors(int iface, int index, bool nxa);
 void opip_gmx_stats_init(int iface, int index);
 void opip_gmx_read_stats(int iface, int index, struct opip_gmx_stats *s);
+bool opip_gmx_preamble_check_off(int iface, int index);
+void opip_gmx_set_preamble_check(int iface, int index, bool enable);
+bool opip_gmx_preamble_errors(int iface, int index);
+int opip_gmx_rgmii_enable(int iface, int num_ports);
+struct opip_link opip_gmx_rgmii_link(int iface, int index);
+void opip_gmx_rgmii_link_set(struct opip *opip, int iface, int index, int port,
+			     const struct opip_link *link);
+void opip_gmx_rgmii_set_delays(int iface, int index, int rx, int tx);
+void opip_gmx_rgmii_loopback(int iface, int index);
 
 #endif /* OCTEON_PIP_GMX_H */
