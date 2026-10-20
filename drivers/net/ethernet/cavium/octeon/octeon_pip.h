@@ -87,6 +87,58 @@ struct platform_device;
 
 /* ------------------------------------------------------------------ */
 
+/* The receive size histogram of the PIP: 64, 65-127, ... 1024-1518, > 1518 */
+#define OPIP_PIP_HIST_BINS	7
+
+/* The counters of the PIP and the PKO, accumulated by the periodic worker */
+struct opip_hw_stats {
+	/* What came in, before the IPD and RED */
+	u64 rx_packets;
+	u64 rx_octets;
+	/* What the PIP parsed and passed on */
+	u64 rx_parsed_packets;
+	u64 rx_parsed_octets;
+	u64 rx_dropped_packets;
+	u64 rx_dropped_octets;
+	u64 rx_fcs_align_errors;
+	u64 rx_runts;
+	u64 rx_runts_fcs;
+	u64 rx_oversize;
+	u64 rx_oversize_fcs;
+	u64 rx_broadcast;
+	u64 rx_multicast;
+	u64 rx_hist[OPIP_PIP_HIST_BINS];
+	u64 tx_packets;
+	u64 tx_octets;
+};
+
+/* The size histogram of the GMX: < 64, 64, 65-127, ... 1024-1518, > 1518 */
+#define OPIP_GMX_HIST_BINS	8
+
+/*
+ * The counters of a port's MAC, what the GMX saw on the wire. The driver
+ * reads and clears them once a second and keeps the sums here.
+ */
+struct opip_gmx_stats {
+	/* PAUSE and other control frames, not passed on */
+	u64 rx_ctl_packets;
+	/* Rejected by the address filter */
+	u64 rx_dmac_packets;
+	/* Dropped by the receive FIFO */
+	u64 rx_drop_packets;
+	u64 tx_packets;
+	u64 tx_octets;
+	u64 tx_ctl_packets;
+	u64 tx_underflow;
+	u64 tx_single_collisions;
+	u64 tx_multiple_collisions;
+	u64 tx_excessive_collisions;
+	u64 tx_excessive_deferrals;
+	u64 tx_multicast;
+	u64 tx_broadcast;
+	u64 tx_hist[OPIP_GMX_HIST_BINS];
+};
+
 /*
  * A transmit queue: one PKO output queue of a port, with the chunk of
  * command words the driver writes for it. Everything that touches it runs
@@ -172,13 +224,32 @@ struct opip_port {
 	int base_queue;
 	int num_queues;
 	phy_interface_t		phy_mode;
+	struct delayed_work	periodic_work;
 	struct work_struct	rx_mode_work;
 	struct device_node	*of_node;
+	spinlock_t		stats_lock;	/* hw_stats, gmx_stats */
+	struct opip_hw_stats	hw_stats;
+	struct opip_gmx_stats	gmx_stats;
+	/* The PKO's counters as last read, under hw_lock */
+	u32			pko_packets;
+	u64			pko_octets;
+	/* Error events of the GMX and the PCS, see opip_poll_errors() */
+	unsigned long tx_pko_nxa;
+	unsigned long pcs_an_error;
+	unsigned long pcs_tx_fifo_error;
 	struct opip_txq		txq[OPIP_MAX_TXQS];
 	struct phylink		*phylink;
 	struct phylink_config	phylink_config;
 	/* The PCS of an SGMII port */
 	struct phylink_pcs	pcs;
+	/*
+	 * Frames dropped for a receive error the PIP does not count, see
+	 * opip_rx_check_error(): cut at the jabber limit, an L2 length field
+	 * that does not match, any other. Several receive groups may count.
+	 */
+	atomic_long_t		rx_jabber;
+	atomic_long_t		rx_l2_length;
+	atomic_long_t		rx_other_errors;
 };
 
 /* opip_group.state */
@@ -269,6 +340,7 @@ struct opip {
 	/* What was put into the pools, to check what comes back */
 	unsigned int wqe_bufs;
 	unsigned int cmd_bufs;
+	struct dentry *debugfs;
 };
 
 static inline struct opip_port *opip_port(struct net_device *dev)
@@ -322,8 +394,14 @@ int opip_link_set(struct opip_port *p, const struct opip_link *link);
 int opip_pcs_setup(struct opip_port *p, bool inband);
 void opip_pcs_restart_an(struct opip_port *p);
 void opip_port_enable(struct opip_port *p, bool en);
+void opip_update_hw_stats(struct net_device *dev);
+void opip_get_hw_stats(struct net_device *dev, struct opip_hw_stats *hw);
+void opip_get_gmx_stats(struct net_device *dev, struct opip_gmx_stats *gmx);
 
 /* octeon_pip_link.c */
 int opip_phylink_create(struct opip_port *p);
+
+/* octeon_pip_ethtool.c */
+extern const struct ethtool_ops opip_ethtool_ops;
 
 #endif /* OCTEON_PIP_H */

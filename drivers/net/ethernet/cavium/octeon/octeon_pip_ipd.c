@@ -362,6 +362,33 @@ unsigned int opip_ipd_bp_count(int port)
 }
 
 /**
+ * opip_ipd_bp_limit - the port's backpressure threshold
+ * @port:  IPD port
+ * @limit: Where the threshold goes
+ *
+ * The counters of the loopback and PCI ports (36 and up) sit elsewhere.
+ *
+ * Return: true if backpressure is enabled for @port
+ */
+bool opip_ipd_bp_limit(int port, unsigned int *limit)
+{
+	u64 cnt = opip_rd(OPIP_IPD_PORT_BP_PAGE_CNT(port));
+
+	*limit = FIELD_GET(OPIP_IPD_PORT_BP_PAGE_CNT_PAGE_CNT, cnt);
+	return cnt & OPIP_IPD_PORT_BP_PAGE_CNT_BP_ENB;
+}
+
+/**
+ * opip_ipd_pool_count - the IPD's own count of the packet pool
+ *
+ * Return: IPD_QUE0_FREE_PAGE_CNT, what RED decides on
+ */
+unsigned int opip_ipd_pool_count(void)
+{
+	return opip_rd(OPIP_IPD_QUE0_FREE_PAGE_CNT);
+}
+
+/**
  * opip_pip_port_config - how the PIP parses and tags a port's packets
  * @iface:       Interface of the port
  * @port:        IPD port
@@ -451,4 +478,50 @@ void opip_pip_frame_length(int n, unsigned int min, unsigned int max)
 	opip_wr(OPIP_PIP_FRM_LEN_CHK(n),
 		FIELD_PREP(OPIP_PIP_FRM_LEN_CHK_MINLEN, min) |
 		FIELD_PREP(OPIP_PIP_FRM_LEN_CHK_MAXLEN, max));
+}
+
+/**
+ * opip_pip_read_stats - read and clear the receive counters of a port
+ * @port: IPD port, the port kind on CN68XX
+ * @s:    Where they go
+ *
+ * PIP_STAT_CTL selects the read-and-clear mode for all ports: the caller
+ * serializes with the other readers. CN68XX counts per port kind, in its
+ * own registers (PIP_STAT_CTL[MODE] 0, as written); the driver gives each
+ * port the kind of its number, see opip_gmx_port_enable().
+ */
+void opip_pip_read_stats(int port, struct opip_pip_stats *s)
+{
+	u64 st[10], inb_pkts, inb_octs;
+	bool pknd = opip_chip->cn68xx;
+	int i;
+
+	opip_wr(OPIP_PIP_STAT_CTL, OPIP_PIP_STAT_CTL_RDCLR);
+	for (i = 0; i < ARRAY_SIZE(st); i++)
+		st[i] = opip_rd(pknd ? OPIP_PIP_STAT_PKND(i, port) :
+				       OPIP_PIP_STAT_PRT(i, port));
+	inb_pkts = opip_rd(pknd ? OPIP_PIP_STAT_INB_PKTS_PKND(port) :
+				  OPIP_PIP_STAT_INB_PKTS(port));
+	inb_octs = opip_rd(pknd ? OPIP_PIP_STAT_INB_OCTS_PKND(port) :
+				  OPIP_PIP_STAT_INB_OCTS(port));
+
+	s->dropped_packets = FIELD_GET(OPIP_PIP_STAT_HI, st[0]);
+	s->dropped_octets = FIELD_GET(OPIP_PIP_STAT_LO, st[0]);
+	s->octets = FIELD_GET(OPIP_PIP_STAT1_OCTS, st[1]);
+	s->packets = FIELD_GET(OPIP_PIP_STAT_HI, st[2]);
+	s->broadcast = FIELD_GET(OPIP_PIP_STAT_HI, st[3]);
+	s->multicast = FIELD_GET(OPIP_PIP_STAT_LO, st[3]);
+	s->fcs_align_errors = FIELD_GET(OPIP_PIP_STAT_HI, st[7]);
+	/* STAT4-6: two bins each, the smaller in the low half; STAT7: > 1518 */
+	for (i = 0; i < OPIP_PIP_HIST_BINS - 1; i += 2) {
+		s->hist[i] = FIELD_GET(OPIP_PIP_STAT_LO, st[4 + i / 2]);
+		s->hist[i + 1] = FIELD_GET(OPIP_PIP_STAT_HI, st[4 + i / 2]);
+	}
+	s->hist[OPIP_PIP_HIST_BINS - 1] = FIELD_GET(OPIP_PIP_STAT_LO, st[7]);
+	s->runts_fcs = FIELD_GET(OPIP_PIP_STAT_HI, st[8]);
+	s->runts = FIELD_GET(OPIP_PIP_STAT_LO, st[8]);
+	s->oversize_fcs = FIELD_GET(OPIP_PIP_STAT_HI, st[9]);
+	s->oversize = FIELD_GET(OPIP_PIP_STAT_LO, st[9]);
+	s->inb_packets = FIELD_GET(OPIP_PIP_STAT_LO, inb_pkts);
+	s->inb_octets = FIELD_GET(OPIP_PIP_STAT_INB_OCTS_OCTS, inb_octs);
 }

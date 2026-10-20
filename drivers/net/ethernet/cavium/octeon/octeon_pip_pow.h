@@ -60,5 +60,8 @@ u64 opip_pow_select_group(unsigned int core, int group);
 void opip_pow_restore_groups(unsigned int core, u64 mask);
 void opip_pow_group_ack(int group);
 void opip_pow_group_irq(int group, bool enable);
+unsigned int opip_pow_queued(int group);
+unsigned int opip_pow_qos_queued(int qos);
+unsigned int opip_pow_int_pending(void);
 
 #endif /* OCTEON_PIP_POW_H */

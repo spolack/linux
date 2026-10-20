@@ -541,3 +541,31 @@ const struct phylink_pcs_ops opip_pcs_ops = {
 	.pcs_an_restart = opip_pcs_ops_an_restart,
 	.pcs_link_up = opip_pcs_ops_link_up,
 };
+
+/**
+ * opip_pcs_poll_errors - count and clear the error bits of a port's PCS
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * Only the bits reported are cleared in PCS_INT_REG.
+ *
+ * Return: the OPIP_PCS_ERR_* bits that were set
+ */
+unsigned int opip_pcs_poll_errors(int iface, int index)
+{
+	u64 pcs = opip_rd(OPIP_PCS_INT_REG(iface, index));
+	unsigned int errors = 0;
+	u64 clr = 0;
+
+	if (pcs & OPIP_PCS_INT_AN_ERR) {
+		clr |= OPIP_PCS_INT_AN_ERR;
+		errors |= OPIP_PCS_ERR_AN;
+	}
+	if (pcs & (OPIP_PCS_INT_TXFIFO | OPIP_PCS_INT_TXFIFU)) {
+		clr |= pcs & (OPIP_PCS_INT_TXFIFO | OPIP_PCS_INT_TXFIFU);
+		errors |= OPIP_PCS_ERR_TX_FIFO;
+	}
+	if (clr)
+		opip_wr(OPIP_PCS_INT_REG(iface, index), clr);
+	return errors;
+}

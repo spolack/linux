@@ -12,6 +12,7 @@
 #include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
 
 #include "octeon_pip.h"
 #include "octeon_pip_gmx.h"
@@ -288,4 +289,149 @@ void opip_gmx_set_speed(int iface, int index, const struct opip_link *link)
 
 	opip_wr(OPIP_GMX_PRT_CFG(iface, index), cfg);
 	opip_rd(OPIP_GMX_PRT_CFG(iface, index));
+}
+
+/**
+ * opip_gmx_stats_init - set a port's MAC counters to clear on read
+ * @iface: Interface
+ * @index: Port on it
+ *
+ * The port's counters clear on read from now on; what the bootloader
+ * collected is read and dropped.
+ */
+void opip_gmx_stats_init(int iface, int index)
+{
+	struct opip_gmx_stats s;
+
+	opip_wr(OPIP_GMX_RX_STATS_CTL(iface, index), OPIP_GMX_STATS_CTL_RD_CLR);
+	opip_wr(OPIP_GMX_TX_STATS_CTL(iface, index), OPIP_GMX_STATS_CTL_RD_CLR);
+	opip_gmx_read_stats(iface, index, &s);
+}
+
+/**
+ * opip_gmx_read_stats - read and clear the MAC counters of a port
+ * @iface: Interface
+ * @index: Port on it
+ * @s:     What was counted since the last read
+ *
+ * The caller accumulates: the hardware counters are 32 bits wide (48 for
+ * octets) and clear on every read.
+ */
+void opip_gmx_read_stats(int iface, int index, struct opip_gmx_stats *s)
+{
+	u64 st[OPIP_GMX_TX_STAT_CTL + 1];
+	int i;
+
+	s->rx_ctl_packets =
+		FIELD_GET(OPIP_GMX_RX_STATS_PKTS_CNT,
+			  opip_rd(OPIP_GMX_RX_STATS_PKTS_CTL(iface, index)));
+	s->rx_dmac_packets =
+		FIELD_GET(OPIP_GMX_RX_STATS_PKTS_CNT,
+			  opip_rd(OPIP_GMX_RX_STATS_PKTS_DMAC(iface, index)));
+	s->rx_drop_packets =
+		FIELD_GET(OPIP_GMX_RX_STATS_PKTS_CNT,
+			  opip_rd(OPIP_GMX_RX_STATS_PKTS_DRP(iface, index)));
+
+	for (i = 0; i < ARRAY_SIZE(st); i++)
+		st[i] = opip_rd(OPIP_GMX_TX_STAT(iface, index, i));
+	s->tx_excessive_deferrals = FIELD_GET(OPIP_GMX_TX_STAT_HI,
+					      st[OPIP_GMX_TX_STAT_COLLISIONS]);
+	s->tx_excessive_collisions = FIELD_GET(OPIP_GMX_TX_STAT_LO,
+					       st[OPIP_GMX_TX_STAT_COLLISIONS]);
+	s->tx_single_collisions = FIELD_GET(OPIP_GMX_TX_STAT_HI,
+					    st[OPIP_GMX_TX_STAT_COLLISIONS_N]);
+	s->tx_multiple_collisions =
+		FIELD_GET(OPIP_GMX_TX_STAT_LO,
+			  st[OPIP_GMX_TX_STAT_COLLISIONS_N]);
+	s->tx_octets = FIELD_GET(OPIP_GMX_TX_STAT2_OCTS,
+				 st[OPIP_GMX_TX_STAT_OCTS]);
+	s->tx_packets = FIELD_GET(OPIP_GMX_TX_STAT_LO,
+				  st[OPIP_GMX_TX_STAT_PKTS]);
+	for (i = 0; i < OPIP_GMX_HIST_BINS; i += 2) {
+		u64 hist = st[OPIP_GMX_TX_STAT_HIST + i / 2];
+
+		s->tx_hist[i] = FIELD_GET(OPIP_GMX_TX_STAT_LO, hist);
+		s->tx_hist[i + 1] = FIELD_GET(OPIP_GMX_TX_STAT_HI, hist);
+	}
+	s->tx_multicast = FIELD_GET(OPIP_GMX_TX_STAT_HI,
+				    st[OPIP_GMX_TX_STAT_CAST]);
+	s->tx_broadcast = FIELD_GET(OPIP_GMX_TX_STAT_LO,
+				    st[OPIP_GMX_TX_STAT_CAST]);
+	s->tx_underflow = FIELD_GET(OPIP_GMX_TX_STAT_HI,
+				    st[OPIP_GMX_TX_STAT_CTL]);
+	s->tx_ctl_packets = FIELD_GET(OPIP_GMX_TX_STAT_LO,
+				      st[OPIP_GMX_TX_STAT_CTL]);
+}
+
+/**
+ * opip_gmx_bp_state - read the backpressure state of an interface
+ * @iface:     Interface
+ * @num_ports: Ports on it; the marks of the first four are read
+ * @s:         The state: GMX_TX_OVR_BP, GMX_RX_PRT_INFO and the FIFO marks
+ *
+ * The backpressure state of an interface, for the debugfs status.
+ */
+void opip_gmx_bp_state(int iface, int num_ports, struct opip_gmx_bp *s)
+{
+	u64 ovr, info;
+	int index;
+
+	ovr = opip_rd(OPIP_GMX_TX_OVR_BP(iface));
+	info = opip_rd(OPIP_GMX_RX_PRT_INFO(iface));
+	memset(s, 0, sizeof(*s));
+	s->ovr_en = FIELD_GET(OPIP_GMX_TX_OVR_BP_EN, ovr);
+	s->ovr_bp = FIELD_GET(OPIP_GMX_TX_OVR_BP_BP, ovr);
+	s->ign_full = FIELD_GET(OPIP_GMX_TX_OVR_BP_IGN_FULL, ovr);
+	s->rx_commit = FIELD_GET(OPIP_GMX_RX_PRT_INFO_COMMIT, info);
+	s->rx_drop = FIELD_GET(OPIP_GMX_RX_PRT_INFO_DROP, info);
+	for (index = 0; index < min(num_ports, 4); index++) {
+		s->bp_on[index] =
+			FIELD_GET(OPIP_GMX_RX_BP_ON_MARK,
+				  opip_rd(OPIP_GMX_RX_BP_ON(iface, index)));
+		s->bp_off[index] =
+			FIELD_GET(OPIP_GMX_RX_BP_MARK,
+				  opip_rd(OPIP_GMX_RX_BP_OFF(iface, index)));
+		s->bp_drop[index] =
+			FIELD_GET(OPIP_GMX_RX_BP_MARK,
+				  opip_rd(OPIP_GMX_RX_BP_DROP(iface, index)));
+	}
+}
+
+/**
+ * opip_gmx_poll_errors - check and clear the error bits of a port
+ * @iface: Interface
+ * @index: Port on it
+ * @nxa:   Check the interface's PKO_NXA as well
+ *
+ * The bits latch in the interrupt registers whether the interrupts are
+ * enabled or not, and nothing enables them. Reported is the PKO's use of
+ * a queue the interface does not have (PKO_NXA, shared by the ports of
+ * the interface, checked by one of them), a driver bug. The FIFO overruns and
+ * underflows are only cleared: the GMX counts the frames they cost. Only
+ * these bits are cleared; the preamble check of RGMII ports reads its
+ * own bit.
+ *
+ * Return: the OPIP_GMX_ERR_* bits that were set
+ */
+unsigned int opip_gmx_poll_errors(int iface, int index, bool nxa)
+{
+	u64 rx = opip_rd(OPIP_GMX_RX_INT_REG(iface, index));
+	u64 tx = opip_rd(OPIP_GMX_TX_INT_REG(iface));
+	unsigned int errors = 0;
+	u64 clr = 0;
+
+	if (rx & OPIP_GMX_RX_INT_OVRERR)
+		opip_wr(OPIP_GMX_RX_INT_REG(iface, index),
+			OPIP_GMX_RX_INT_OVRERR);
+
+	/* The ports of an interface share it: each clears only its own bits */
+	if (FIELD_GET(OPIP_GMX_TX_INT_UNDFLW, tx) & BIT(index))
+		clr |= FIELD_PREP(OPIP_GMX_TX_INT_UNDFLW, BIT(index));
+	if (nxa && (tx & OPIP_GMX_TX_INT_PKO_NXA)) {
+		clr |= OPIP_GMX_TX_INT_PKO_NXA;
+		errors |= OPIP_GMX_ERR_PKO_NXA;
+	}
+	if (clr)
+		opip_wr(OPIP_GMX_TX_INT_REG(iface), clr);
+	return errors;
 }

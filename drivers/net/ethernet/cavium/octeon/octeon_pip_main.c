@@ -13,6 +13,7 @@
  * Copyright (c) 2003-2018 Cavium, Inc. / Cavium Networks.
  */
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/if_ether.h>
@@ -24,7 +25,9 @@
 #include <linux/of_net.h>
 #include <linux/platform_device.h>
 #include <linux/rtnetlink.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <net/netdev_queues.h>
 
 #include "octeon_pip.h"
 #include "octeon_pip_fpa.h"
@@ -126,6 +129,410 @@ void opip_port_enable(struct opip_port *p, bool en)
 	mutex_lock(&p->opip->hw_lock);
 	opip_gmx_port_enable(p->iface->num, p->index, en, p->port);
 	mutex_unlock(&p->opip->hw_lock);
+}
+
+/* ------------------------------------------------------------------ */
+/* Statistics */
+
+/**
+ * opip_update_hw_stats - accumulate the hardware counters of a port
+ * @dev: The port's network device
+ *
+ * The counters of the PIP and the GMX are cleared on read; the PKO's keep
+ * running and give what they moved since the last read. Called from
+ * process context, once a second by the periodic worker, and by ethtool.
+ */
+void opip_update_hw_stats(struct net_device *dev)
+{
+	struct opip_port *p = opip_port(dev);
+	struct opip_gmx_stats gmx = {};
+	u32 tx_packets, pko_packets;
+	u64 tx_octets, pko_octets;
+	struct opip_hw_stats *hw;
+	struct opip_pip_stats rx;
+	unsigned long flags;
+	int i;
+
+	hw = &p->hw_stats;
+
+	/* The simulator has no counters */
+	if (opip_on_simulator())
+		return;
+
+	mutex_lock(&p->opip->hw_lock);
+	opip_pip_read_stats(p->port, &rx);
+	opip_pko_read_stats(p->opip, p->port, &pko_packets, &pko_octets);
+	tx_packets = pko_packets - p->pko_packets;
+	tx_octets = (pko_octets - p->pko_octets) & OPIP_PKO_MEM_COUNT1_COUNT;
+	p->pko_packets = pko_packets;
+	p->pko_octets = pko_octets;
+	/* Wrap or saturate, the counters are cleared long before either */
+	if (pko_packets >= BIT(31) || pko_octets >= BIT_ULL(47)) {
+		opip_pko_clear_stats(p->opip, p->port);
+		p->pko_packets = 0;
+		p->pko_octets = 0;
+	}
+	if (opip_port_has_gmx(p))
+		opip_gmx_read_stats(p->iface->num, p->index, &gmx);
+	mutex_unlock(&p->opip->hw_lock);
+
+	spin_lock_irqsave(&p->stats_lock, flags);
+	p->gmx_stats.rx_ctl_packets += gmx.rx_ctl_packets;
+	p->gmx_stats.rx_dmac_packets += gmx.rx_dmac_packets;
+	p->gmx_stats.rx_drop_packets += gmx.rx_drop_packets;
+	p->gmx_stats.tx_packets += gmx.tx_packets;
+	p->gmx_stats.tx_octets += gmx.tx_octets;
+	p->gmx_stats.tx_ctl_packets += gmx.tx_ctl_packets;
+	p->gmx_stats.tx_underflow += gmx.tx_underflow;
+	p->gmx_stats.tx_single_collisions += gmx.tx_single_collisions;
+	p->gmx_stats.tx_multiple_collisions += gmx.tx_multiple_collisions;
+	p->gmx_stats.tx_excessive_collisions += gmx.tx_excessive_collisions;
+	p->gmx_stats.tx_excessive_deferrals += gmx.tx_excessive_deferrals;
+	p->gmx_stats.tx_multicast += gmx.tx_multicast;
+	p->gmx_stats.tx_broadcast += gmx.tx_broadcast;
+	for (i = 0; i < OPIP_GMX_HIST_BINS; i++)
+		p->gmx_stats.tx_hist[i] += gmx.tx_hist[i];
+	hw->rx_packets += rx.inb_packets;
+	hw->rx_octets += rx.inb_octets;
+	hw->rx_parsed_packets += rx.packets;
+	hw->rx_parsed_octets += rx.octets;
+	hw->rx_dropped_packets += rx.dropped_packets;
+	hw->rx_dropped_octets += rx.dropped_octets;
+	hw->rx_fcs_align_errors += rx.fcs_align_errors;
+	hw->rx_runts += rx.runts;
+	hw->rx_runts_fcs += rx.runts_fcs;
+	hw->rx_oversize += rx.oversize;
+	hw->rx_oversize_fcs += rx.oversize_fcs;
+	hw->rx_broadcast += rx.broadcast;
+	hw->rx_multicast += rx.multicast;
+	for (i = 0; i < OPIP_PIP_HIST_BINS; i++)
+		hw->rx_hist[i] += rx.hist[i];
+	hw->tx_packets += tx_packets;
+	hw->tx_octets += tx_octets;
+	spin_unlock_irqrestore(&p->stats_lock, flags);
+}
+
+/**
+ * opip_get_hw_stats - a consistent copy of the accumulated counters
+ * @dev: The port's network device
+ * @hw:  The copy
+ */
+void opip_get_hw_stats(struct net_device *dev, struct opip_hw_stats *hw)
+{
+	struct opip_port *p = opip_port(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->stats_lock, flags);
+	*hw = p->hw_stats;
+	spin_unlock_irqrestore(&p->stats_lock, flags);
+}
+
+/**
+ * opip_get_gmx_stats - a consistent copy of the accumulated MAC counters
+ * @dev: The port's network device
+ * @gmx: The copy
+ */
+void opip_get_gmx_stats(struct net_device *dev, struct opip_gmx_stats *gmx)
+{
+	struct opip_port *p = opip_port(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&p->stats_lock, flags);
+	*gmx = p->gmx_stats;
+	spin_unlock_irqrestore(&p->stats_lock, flags);
+}
+
+/*
+ * May be called in atomic context, so it reports what the periodic worker
+ * collected, up to a second old. The core adds the drops counted in
+ * software.
+ */
+static void opip_get_stats64(struct net_device *dev,
+			     struct rtnl_link_stats64 *stats)
+{
+	struct opip_port *p = opip_port(dev);
+	unsigned long jabber, l2_length;
+	struct opip_gmx_stats gmx;
+	struct opip_hw_stats hw;
+
+	opip_get_hw_stats(dev, &hw);
+	opip_get_gmx_stats(dev, &gmx);
+	jabber = atomic_long_read(&p->rx_jabber);
+	l2_length = atomic_long_read(&p->rx_l2_length);
+	/* What the PIP passed on; the RED drops are missed */
+	stats->rx_packets = hw.rx_parsed_packets;
+	stats->rx_bytes = hw.rx_parsed_octets;
+	stats->rx_otherhost_dropped = gmx.rx_dmac_packets;
+	stats->tx_packets = hw.tx_packets;
+	stats->tx_bytes = hw.tx_octets;
+	stats->multicast = hw.rx_multicast;
+	stats->rx_crc_errors = hw.rx_fcs_align_errors;
+	/* Fragments and jabbers have a wrong length and a bad FCS: length */
+	stats->rx_length_errors = hw.rx_runts + hw.rx_runts_fcs +
+				  hw.rx_oversize + hw.rx_oversize_fcs +
+				  jabber + l2_length;
+	stats->rx_missed_errors = hw.rx_dropped_packets;
+	/*
+	 * The GMX counts the frames its FIFOs lost; the error bits are events
+	 */
+	stats->rx_fifo_errors = gmx.rx_drop_packets;
+	/* The PIP's error classes are by frame size, each frame in one */
+	stats->rx_errors = hw.rx_fcs_align_errors + hw.rx_runts +
+			   hw.rx_runts_fcs + hw.rx_oversize +
+			   hw.rx_oversize_fcs + stats->rx_fifo_errors +
+			   jabber + l2_length +
+			   atomic_long_read(&p->rx_other_errors);
+	stats->tx_fifo_errors = gmx.tx_underflow;
+	stats->tx_aborted_errors = gmx.tx_excessive_collisions;
+	stats->tx_errors = stats->tx_fifo_errors + stats->tx_aborted_errors;
+	stats->collisions = gmx.tx_single_collisions +
+			    gmx.tx_multiple_collisions;
+}
+
+static void opip_get_queue_stats_tx(struct net_device *dev, int idx,
+				    struct netdev_queue_stats_tx *stats)
+{
+	stats->stop = READ_ONCE(opip_port(dev)->txq[idx].stopped);
+}
+
+static void opip_get_base_stats(struct net_device *dev,
+				struct netdev_queue_stats_rx *rx,
+				struct netdev_queue_stats_tx *tx)
+{
+	tx->stop = 0;
+}
+
+static const struct netdev_stat_ops opip_stat_ops = {
+	.get_queue_stats_tx	= opip_get_queue_stats_tx,
+	.get_base_stats		= opip_get_base_stats,
+};
+
+/* The pools, and the IPD's view of the packet pool: RED decides on it */
+static void opip_debugfs_pools(struct seq_file *m)
+{
+	unsigned int fpa = opip_fpa_level(OPIP_POOL_PACKET);
+	unsigned int ipd = opip_ipd_pool_count();
+
+	seq_printf(m, "fpa packet buffers %u\n", fpa);
+	seq_printf(m, "fpa wqe buffers %u\n", opip_fpa_level(OPIP_POOL_WQE));
+	seq_printf(m, "fpa output buffers %u\n", opip_fpa_level(OPIP_POOL_CMD));
+	seq_printf(m, "ipd packet buffers %u (difference %d)\n",
+		   ipd, (int)(fpa - ipd));
+}
+
+/*
+ * Work the cores have not taken yet: the backlog of each group, the
+ * groups whose interrupt is raised, and the input queue of each QOS level
+ * (a port's level is port & 7).
+ */
+static void opip_debugfs_pow(struct seq_file *m, struct opip *opip)
+{
+	int group, i;
+
+	seq_printf(m, "pow queued %u groups", opip_pow_queued(-1));
+	for (group = 0; group < OPIP_MAX_GROUPS; group++)
+		if (opip->groups_mask & BIT(group))
+			seq_printf(m, " %d:%u", group, opip_pow_queued(group));
+	seq_printf(m, " int %#x qos", opip_pow_int_pending());
+	for (i = 0; i < 8; i++)
+		seq_printf(m, " %d:%u", i, opip_pow_qos_queued(i));
+	seq_puts(m, "\n");
+}
+
+/* The backpressure state of the GMX interfaces: a bit per port in each field */
+static void opip_debugfs_gmx(struct seq_file *m, struct opip *opip)
+{
+	int i, index;
+
+	for (i = 0; i < opip->num_ifaces; i++) {
+		struct opip_iface *iface = &opip->ifaces[i];
+		struct opip_gmx_bp bp;
+
+		if (iface->num >= 2 || !opip_iface_is_gmx(iface))
+			continue;
+		opip_gmx_bp_state(iface->num, iface->num_ports, &bp);
+		seq_printf(m, "gmx%d tx_ovr_bp en %#x bp %#x ign_full %#x rx_prt_info commit %#x drop %#x marks",
+			   iface->num, bp.ovr_en, bp.ovr_bp, bp.ign_full,
+			   bp.rx_commit, bp.rx_drop);
+		for (index = 0; index < min(iface->num_ports, 4); index++)
+			seq_printf(m, " %u/%u/%u", bp.bp_on[index],
+				   bp.bp_off[index], bp.bp_drop[index]);
+		seq_puts(m, "\n");
+	}
+}
+
+/*
+ * The PCS of a port: in band or out of band (PCS_MR_CONTROL[AN_EN]) and
+ * the MAC side. The link status only for SGMII and QSGMII out of band:
+ * PCS_MR_STATUS[LNK_ST] latches low and a read clears it, which phylink's
+ * poll must see in band and on 1000BASE-X. In band the autonegotiation's
+ * result and what the partner sent; out of band PCS_AN_RESULTS is
+ * undefined.
+ */
+static void opip_debugfs_pcs(struct seq_file *m, struct net_device *dev)
+{
+	static const unsigned int speeds[] = { 10, 100, 1000, 0 };
+	u64 ctl, st = 0, res = 0, lp = 0, misc;
+	struct opip_port *p = opip_port(dev);
+	int iface = p->iface->num;
+	int index = p->index;
+	bool inband, basex;
+
+	mutex_lock(&p->opip->hw_lock);
+	ctl = opip_rd(OPIP_PCS_MR_CONTROL(iface, index));
+	misc = opip_rd(OPIP_PCS_MISC_CTL(iface, index));
+	inband = ctl & OPIP_PCS_MR_CONTROL_AN_EN;
+	basex = misc & OPIP_PCS_MISC_CTL_MODE;
+	if (inband) {
+		res = opip_rd(OPIP_PCS_AN_RESULTS(iface, index));
+		lp = opip_rd(OPIP_PCS_AN_LP_ABIL(iface, index));
+	} else if (!basex) {
+		st = opip_rd(OPIP_PCS_MR_STATUS(iface, index));
+	}
+	mutex_unlock(&p->opip->hw_lock);
+
+	seq_printf(m, "%s port %d pcs %s %s control %#llx", dev->name, p->port,
+		   phy_modes(p->phy_mode), inband ? "in-band" : "out-of-band",
+		   ctl);
+	if (!inband && !basex)
+		seq_printf(m, " status %#llx link %s", st,
+			   st & OPIP_PCS_MR_STATUS_LNK_ST ? "up" : "down");
+	seq_printf(m, " misc %#llx %s gmxeno %d samp_pt %llu\n", misc,
+		   misc & OPIP_PCS_MISC_CTL_MAC_PHY ? "phy-side" : "mac-side",
+		   !!(misc & OPIP_PCS_MISC_CTL_GMXENO),
+		   FIELD_GET(OPIP_PCS_MISC_CTL_SAMP_PT, misc));
+	if (!inband)
+		return;
+	/* 1000BASE-X: a clause 37 word, no SGMII speed */
+	if (basex) {
+		seq_printf(m, "%s port %d pcs an results %#llx lp %#llx\n",
+			   dev->name, p->port, res, lp);
+		return;
+	}
+	seq_printf(m, "%s port %d pcs an results %#llx link_ok %d an_complete %d speed %u %s lp %#llx\n",
+		   dev->name, p->port, res,
+		   !!(res & OPIP_PCS_AN_RESULTS_LINK_OK),
+		   !!(res & OPIP_PCS_AN_RESULTS_AN_CPT),
+		   speeds[FIELD_GET(OPIP_PCS_AN_RESULTS_SPD, res)],
+		   res & OPIP_PCS_AN_RESULTS_DUP ? "full" : "half", lp);
+}
+
+/*
+ * Per port: the packets in flight on each transmit queue, the commands the
+ * PKO has been told of and not fetched yet, the IPD's backpressure count
+ * of the GMX ports, and the PCS. Under rtnl: the devices and their queue
+ * counts.
+ */
+static void opip_debugfs_port(struct seq_file *m, struct net_device *dev)
+{
+	struct opip_port *p = opip_port(dev);
+	unsigned int qid;
+
+	seq_printf(m, "%s port %d queues %d-%d inflight", dev->name, p->port,
+		   p->base_queue, p->base_queue + dev->real_num_tx_queues - 1);
+	for (qid = 0; qid < dev->real_num_tx_queues; qid++)
+		seq_printf(m, " %u", READ_ONCE(p->txq[qid].tail) -
+			   READ_ONCE(p->txq[qid].head));
+	seq_puts(m, "\n");
+
+	seq_printf(m, "%s port %d pko words", dev->name, p->port);
+	for (qid = 0; qid < dev->real_num_tx_queues; qid++)
+		seq_printf(m, " %u",
+			   opip_pko_queue_pending(p->opip, p->txq[qid].queue));
+	seq_puts(m, "\n");
+
+	if (opip_port_has_gmx(p)) {
+		unsigned int limit;
+		bool on;
+
+		on = opip_ipd_bp_limit(p->port, &limit);
+
+		seq_printf(m, "%s port %d ipd buffers %u backpressure %s limit %u\n",
+			   dev->name, p->port, opip_ipd_bp_count(p->port),
+			   on ? "on" : "off", limit);
+	}
+	if (opip_port_has_pcs(p))
+		opip_debugfs_pcs(m, dev);
+}
+
+static struct dentry *opip_debugfs_root;
+
+/* The state of the blocks, levels rather than counters, for a bug report */
+static int opip_debugfs_show(struct seq_file *m, void *v)
+{
+	struct opip *opip = m->private;
+	int port;
+
+	opip_debugfs_pools(m);
+	opip_debugfs_pow(m, opip);
+	/* PKO_REG_ERROR: parity, bad doorbell, zero buffer pointer */
+	seq_printf(m, "pko error %#llx\n", opip_pko_error());
+	opip_debugfs_gmx(m, opip);
+
+	rtnl_lock();
+	for (port = 0; port < OPIP_MAX_PORTS; port++)
+		if (opip->ports[port])
+			opip_debugfs_port(m, opip->ports[port]);
+	rtnl_unlock();
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(opip_debugfs);
+
+/* ------------------------------------------------------------------ */
+/* The periodic worker of a port */
+
+static void opip_count_error(struct opip_port *p, unsigned long *counter,
+			     const char *what)
+{
+	WRITE_ONCE(*counter, *counter + 1);
+	if (net_ratelimit())
+		netdev_warn(p->netdev, "%s\n", what);
+}
+
+/*
+ * Error conditions of the GMX and the PCS that should not happen. The
+ * FIFO overruns and underflows are not among them: the GMX counts the
+ * frames they cost (rx_fifo_errors, tx_fifo_errors).
+ */
+static void opip_poll_errors(struct opip_port *p)
+{
+	int i, iface = p->iface->num;
+	unsigned int errors;
+	bool nxa = true;
+
+	if (!opip_port_has_gmx(p))
+		return;
+
+	/* The interface's PKO_NXA goes to its first port with a device */
+	for (i = 0; i < p->index; i++)
+		if (READ_ONCE(p->opip->ports[opip_port_number(iface, i)]))
+			nxa = false;
+	errors = opip_gmx_poll_errors(iface, p->index, nxa);
+	if (errors & OPIP_GMX_ERR_PKO_NXA)
+		opip_count_error(p, &p->tx_pko_nxa,
+				 "PKO used a nonexistent queue of the interface");
+
+	if (!opip_port_has_pcs(p))
+		return;
+	errors = opip_pcs_poll_errors(p->iface->num, p->index);
+	if (errors & OPIP_PCS_ERR_AN)
+		opip_count_error(p, &p->pcs_an_error,
+				 "PCS autonegotiation error");
+	if (errors & OPIP_PCS_ERR_TX_FIFO)
+		opip_count_error(p, &p->pcs_tx_fifo_error,
+				 "PCS transmit FIFO error");
+}
+
+static void opip_periodic_worker(struct work_struct *work)
+{
+	struct opip_port *p = container_of(work, struct opip_port,
+					   periodic_work.work);
+
+	opip_poll_errors(p);
+	opip_update_hw_stats(p->netdev);
+
+	if (!READ_ONCE(p->opip->stopping))
+		schedule_delayed_work(&p->periodic_work, HZ);
 }
 
 static void opip_refill_worker(struct work_struct *work)
@@ -273,6 +680,16 @@ static int opip_ndo_init(struct net_device *dev)
 	opip_set_mac_filter(dev);
 	opip_set_hw_mtu(dev, dev->mtu);
 
+	/* Don't show the counters of the bootloader: read and drop them */
+	if (opip_port_has_gmx(p) && !opip_on_simulator()) {
+		mutex_lock(&p->opip->hw_lock);
+		opip_gmx_stats_init(p->iface->num, p->index);
+		mutex_unlock(&p->opip->hw_lock);
+	}
+	opip_update_hw_stats(dev);
+	memset(&p->hw_stats, 0, sizeof(p->hw_stats));
+	memset(&p->gmx_stats, 0, sizeof(p->gmx_stats));
+
 	opip_port_enable(p, false);
 	return 0;
 }
@@ -352,6 +769,7 @@ static const struct net_device_ops opip_netdev_ops = {
 	.ndo_set_mac_address	= opip_set_mac_address,
 	.ndo_eth_ioctl		= opip_ioctl,
 	.ndo_change_mtu		= opip_change_mtu,
+	.ndo_get_stats64	= opip_get_stats64,
 #ifdef CONFIG_NET_POLL_CONTROLLER
 	.ndo_poll_controller	= opip_tx_netpoll,
 #endif
@@ -522,12 +940,16 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	p->of_node = np;
 	dev->dev.of_node = np;
 	p->phy_mode = PHY_INTERFACE_MODE_NA;
+	INIT_DELAYED_WORK(&p->periodic_work, opip_periodic_worker);
 	INIT_WORK(&p->rx_mode_work, opip_rx_mode_worker);
+	spin_lock_init(&p->stats_lock);
 	netif_set_real_num_tx_queues(dev, min_t(int, num_queues,
 						num_possible_cpus()));
 	dev->min_mtu = VLAN_ETH_ZLEN - OPIP_MTU_OVERHEAD;
 	dev->max_mtu = OPIP_MAX_FRAME - OPIP_MTU_OVERHEAD;
 	dev->netdev_ops = &opip_netdev_ops;
+	dev->ethtool_ops = &opip_ethtool_ops;
+	dev->stat_ops = &opip_stat_ops;
 	/*
 	 * The gather list of a packet sits in its skb->cb and a transmit may
 	 * linearize or pad the skb: none may be sent again while in flight
@@ -1204,6 +1626,7 @@ static int opip_register_ports(struct opip *opip)
 			continue;
 		}
 		opip_setup_xps(dev);
+		schedule_delayed_work(&p->periodic_work, HZ);
 		num++;
 	}
 	return num;
@@ -1222,6 +1645,7 @@ static void opip_unregister_ports(struct opip *opip)
 			continue;
 		p = opip_port(dev);
 		unregister_netdev(dev);
+		cancel_delayed_work_sync(&p->periodic_work);
 		cancel_work_sync(&p->rx_mode_work);
 	}
 }
@@ -1258,6 +1682,7 @@ static void opip_pko_stop(void)
  */
 static void opip_teardown(struct opip *opip)
 {
+	debugfs_remove_recursive(opip->debugfs);
 	opip_ipd_disable();
 	WRITE_ONCE(opip->stopping, true);
 	cancel_delayed_work_sync(&opip->refill_work);
@@ -1387,6 +1812,12 @@ static int opip_probe(struct platform_device *pdev)
 
 	opip_input_enable(opip);
 
+	/* The state of the blocks, there when the first port appears */
+	opip->debugfs = debugfs_create_dir(dev_name(&pdev->dev),
+					   opip_debugfs_root);
+	debugfs_create_file("status", 0444, opip->debugfs, opip,
+			    &opip_debugfs_fops);
+
 	if (!opip_register_ports(opip)) {
 		dev_err(&pdev->dev, "no device could be registered\n");
 		ret = -ENODEV;
@@ -1435,7 +1866,25 @@ static struct platform_driver opip_driver = {
 	},
 };
 
-module_platform_driver(opip_driver);
+/* debugfs: octeon_pip/<device>/status */
+static int __init opip_init(void)
+{
+	int ret;
+
+	opip_debugfs_root = debugfs_create_dir(KBUILD_MODNAME, NULL);
+	ret = platform_driver_register(&opip_driver);
+	if (ret)
+		debugfs_remove(opip_debugfs_root);
+	return ret;
+}
+module_init(opip_init);
+
+static void __exit opip_exit(void)
+{
+	platform_driver_unregister(&opip_driver);
+	debugfs_remove(opip_debugfs_root);
+}
+module_exit(opip_exit);
 
 /* phylink connects the PHY at open: with both modules, the bus must exist */
 MODULE_SOFTDEP("pre: mdio-octeon");

@@ -91,3 +91,48 @@ void opip_pow_group_irq(int group, bool enable)
 			FIELD_PREP(OPIP_POW_WQ_INT_PC_PC_THR, 5));
 	}
 }
+
+/**
+ * opip_pow_queued - entries waiting for a group
+ * @group: The group, or -1 for all groups together
+ *
+ * Return: how much work (received packets, transmit completions) the
+ * cores have not taken yet
+ */
+unsigned int opip_pow_queued(int group)
+{
+	if (group < 0)
+		return FIELD_GET(OPIP_POW_IQ_CNT_IQ_CNT,
+				 opip_rd(opip_chip->cn68xx ?
+					 OPIP_SSO_IQ_COM_CNT :
+					 OPIP_POW_IQ_COM_CNT));
+	return FIELD_GET(OPIP_POW_WQ_INT_CNT_IQ_CNT,
+			 opip_rd(opip_chip->cn68xx ?
+				 OPIP_SSO_WQ_INT_CNT(group) :
+				 OPIP_POW_WQ_INT_CNT(group)));
+}
+
+/**
+ * opip_pow_qos_queued - entries waiting in a QOS level
+ * @qos: The QOS level (a port's is port & 7)
+ *
+ * Return: the entries in the input queue of @qos
+ */
+unsigned int opip_pow_qos_queued(int qos)
+{
+	return FIELD_GET(OPIP_POW_IQ_CNT_IQ_CNT,
+			 opip_rd(opip_chip->cn68xx ?
+				 OPIP_SSO_IQ_CNT(qos) : OPIP_POW_IQ_CNT(qos)));
+}
+
+/**
+ * opip_pow_int_pending - groups with a raised interrupt
+ *
+ * Return: a mask of the groups whose interrupt is raised right now
+ */
+unsigned int opip_pow_int_pending(void)
+{
+	if (opip_chip->cn68xx)
+		return opip_rd(OPIP_SSO_WQ_INT) & OPIP_POW_WQ_INT_WQ_INT;
+	return FIELD_GET(OPIP_POW_WQ_INT_WQ_INT, opip_rd(OPIP_POW_WQ_INT));
+}

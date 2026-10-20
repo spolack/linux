@@ -437,6 +437,61 @@ unsigned int opip_pko_queue_pending(struct opip *opip, int queue)
 }
 
 /**
+ * opip_pko_error - the error bits of the PKO
+ *
+ * Return: PKO_REG_ERROR as it stands; the watchdog clears it
+ */
+u64 opip_pko_error(void)
+{
+	return opip_rd(OPIP_PKO_REG_ERROR);
+}
+
+/**
+ * opip_pko_read_stats - read the transmit counters of a port
+ * @opip:    The complex
+ * @port:    PKO port
+ * @packets: Set to the packets sent, a 32 bit counter
+ * @octets:  Set to the octets sent, a 48 bit counter
+ *
+ * Under pko_idx_lock, as PKO_REG_READ_IDX selects the port. Only a write
+ * clears them, which would drop what the PKO counts between the read and
+ * the write; they are left running until opip_pko_clear_stats().
+ */
+void opip_pko_read_stats(struct opip *opip, int port, u32 *packets, u64 *octets)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&opip->pko_idx_lock, flags);
+	opip_wr(OPIP_PKO_REG_READ_IDX,
+		FIELD_PREP(OPIP_PKO_REG_READ_IDX_INDEX, port));
+	*packets = FIELD_GET(OPIP_PKO_MEM_COUNT0_COUNT,
+			     opip_rd(OPIP_PKO_MEM_COUNT0));
+	*octets = FIELD_GET(OPIP_PKO_MEM_COUNT1_COUNT,
+			    opip_rd(OPIP_PKO_MEM_COUNT1));
+	spin_unlock_irqrestore(&opip->pko_idx_lock, flags);
+}
+
+/**
+ * opip_pko_clear_stats - clear the transmit counters of a port
+ * @opip: The complex
+ * @port: PKO port
+ *
+ * A write with the port number clears the port's counter; what the PKO
+ * counts between the last read and the write is lost.
+ */
+void opip_pko_clear_stats(struct opip *opip, int port)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&opip->pko_idx_lock, flags);
+	opip_wr(OPIP_PKO_MEM_COUNT0,
+		FIELD_PREP(OPIP_PKO_MEM_COUNT0_COUNT, port));
+	opip_wr(OPIP_PKO_MEM_COUNT1,
+		FIELD_PREP(OPIP_PKO_MEM_COUNT1_COUNT, port));
+	spin_unlock_irqrestore(&opip->pko_idx_lock, flags);
+}
+
+/**
  * opip_pko_gmx_port_mode - tell the PKO how many ports a GMX interface has
  * @iface:     Interface, 0 or 1
  * @num_ports: Ports on it

@@ -14,6 +14,10 @@
 
 #include "octeon_pip.h"
 
+/* The error bits opip_pcs_poll_errors() reports */
+#define OPIP_PCS_ERR_AN		BIT(0)
+#define OPIP_PCS_ERR_TX_FIFO	BIT(1)
+
 extern const struct phylink_pcs_ops opip_pcs_ops;
 
 bool opip_pcs_basex(int iface, int index);
@@ -24,4 +28,6 @@ struct opip_link opip_pcs_link(int iface, int index);
 int opip_pcs_link_up(int iface, int index, const struct opip_link *link,
 		     bool inband);
 int opip_pcs_link_set(int iface, int index, const struct opip_link *link);
+unsigned int opip_pcs_poll_errors(int iface, int index);
+
 #endif /* OCTEON_PIP_PCS_H */

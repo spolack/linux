@@ -53,10 +53,15 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 	return OPIP_CSR(OPIP_GMX_BASE + off + (u64)iface * opip_iface_stride());
 }
 
+#define OPIP_GMX_RX_INT_REG(i, p)	opip_gmx_port_reg(i, p, 0x000)
 #define OPIP_GMX_PRT_CFG(i, p)		opip_gmx_port_reg(i, p, 0x010)
 #define OPIP_GMX_RX_FRM_CTL(i, p)	opip_gmx_port_reg(i, p, 0x018)
 #define OPIP_GMX_RX_FRM_MAX(i, p)	opip_gmx_port_reg(i, p, 0x030)
 #define OPIP_GMX_RX_JABBER(i, p)	opip_gmx_port_reg(i, p, 0x038)
+#define OPIP_GMX_RX_STATS_CTL(i, p)	opip_gmx_port_reg(i, p, 0x050)
+#define OPIP_GMX_RX_STATS_PKTS_CTL(i, p)	opip_gmx_port_reg(i, p, 0x090)
+#define OPIP_GMX_RX_STATS_PKTS_DMAC(i, p)	opip_gmx_port_reg(i, p, 0x0A0)
+#define OPIP_GMX_RX_STATS_PKTS_DRP(i, p)	opip_gmx_port_reg(i, p, 0x0B0)
 #define OPIP_GMX_RX_ADR_CTL(i, p)	opip_gmx_port_reg(i, p, 0x100)
 #define OPIP_GMX_RX_ADR_CAM_EN(i, p)	opip_gmx_port_reg(i, p, 0x108)
 #define OPIP_GMX_RX_ADR_CAM(i, p, n)	opip_gmx_port_reg(i, p, 0x180 + (n) * 8)
@@ -65,8 +70,16 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_GMX_TX_SLOT(i, p)		opip_gmx_port_reg(i, p, 0x220)
 #define OPIP_GMX_TX_BURST(i, p)		opip_gmx_port_reg(i, p, 0x228)
 #define OPIP_GMX_SMAC(i, p)		opip_gmx_port_reg(i, p, 0x230)
+#define OPIP_GMX_TX_STATS_CTL(i, p)	opip_gmx_port_reg(i, p, 0x268)
+#define OPIP_GMX_TX_STAT(i, p, n)	opip_gmx_port_reg(i, p, 0x280 + (n) * 8)
 #define OPIP_GMX_RX_PRTS(i)		opip_gmx_reg(i, 0x410)
+#define OPIP_GMX_RX_BP_DROP(i, p)	opip_gmx_reg(i, 0x420 + (p) * 8)
+#define OPIP_GMX_RX_BP_ON(i, p)		opip_gmx_reg(i, 0x440 + (p) * 8)
+#define OPIP_GMX_RX_BP_OFF(i, p)	opip_gmx_reg(i, 0x460 + (p) * 8)
 #define OPIP_GMX_TX_PRTS(i)		opip_gmx_reg(i, 0x480)
+#define OPIP_GMX_TX_OVR_BP(i)		opip_gmx_reg(i, 0x4C8)
+#define OPIP_GMX_RX_PRT_INFO(i)		opip_gmx_reg(i, 0x4E8)
+#define OPIP_GMX_TX_INT_REG(i)		opip_gmx_reg(i, 0x500)
 #define OPIP_GMX_INF_MODE(i)		opip_gmx_reg(i, 0x7F8)
 
 /* GMX_PRTn_CFG */
@@ -85,6 +98,10 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 #define OPIP_GMX_RX_FRM_CTL_CTL_BCK	BIT_ULL(3)
 #define OPIP_GMX_RX_FRM_CTL_CTL_DRP	BIT_ULL(2)
 #define OPIP_GMX_RX_FRM_CTL_PRE_CHK	BIT_ULL(0)
+
+/* GMX_RXn_INT_REG, the bits the driver looks at */
+#define OPIP_GMX_RX_INT_PCTERR		BIT_ULL(11)
+#define OPIP_GMX_RX_INT_OVRERR		BIT_ULL(10)
 
 /* GMX_RXn_ADR_CTL */
 #define OPIP_GMX_RX_ADR_CTL_CAM_MODE	BIT_ULL(3)
@@ -105,6 +122,49 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 /* GMX_TXn_APPEND */
 #define OPIP_GMX_TX_APPEND_FCS		BIT_ULL(2)
 #define OPIP_GMX_TX_APPEND_PAD		BIT_ULL(1)
+
+/*
+ * GMX_RXn_STATS_CTL, GMX_TXn_STATS_CTL: the port's counters clear on read.
+ * The receive counters are 32 bits (packets) and 48 bits (octets). The
+ * transmit counters come in pairs: STAT0 excessive deferrals (63:32) and
+ * excessive collisions (31:0), STAT1 single (63:32) and multiple (31:0)
+ * collisions, STAT2 octets (47:0), STAT3 packets (31:0), STAT4-7 the
+ * size histogram (two sizes per register, the smaller in the low half:
+ * < 64, 64, 65-127, 128-255, 256-511, 512-1023, 1024-1518, > 1518),
+ * STAT8 multicast (63:32) and broadcast (31:0), STAT9 underflows (63:32)
+ * and control frames (31:0).
+ */
+#define OPIP_GMX_STATS_CTL_RD_CLR	BIT_ULL(0)
+#define OPIP_GMX_RX_STATS_PKTS_CNT	GENMASK_ULL(31, 0)
+#define OPIP_GMX_TX_STAT_HI		GENMASK_ULL(63, 32)
+#define OPIP_GMX_TX_STAT_LO		GENMASK_ULL(31, 0)
+#define OPIP_GMX_TX_STAT2_OCTS		GENMASK_ULL(47, 0)
+#define OPIP_GMX_TX_STAT_COLLISIONS	0
+#define OPIP_GMX_TX_STAT_COLLISIONS_N	1
+#define OPIP_GMX_TX_STAT_OCTS		2
+#define OPIP_GMX_TX_STAT_PKTS		3
+#define OPIP_GMX_TX_STAT_HIST		4
+#define OPIP_GMX_TX_STAT_CAST		8
+#define OPIP_GMX_TX_STAT_CTL		9
+
+/* GMX_TX_OVR_BP: one bit per port in each field */
+#define OPIP_GMX_TX_OVR_BP_EN		GENMASK_ULL(11, 8)
+#define OPIP_GMX_TX_OVR_BP_BP		GENMASK_ULL(7, 4)
+#define OPIP_GMX_TX_OVR_BP_IGN_FULL	GENMASK_ULL(3, 0)
+
+/* GMX_RX_PRT_INFO: one bit per port, the receive FIFO's state */
+#define OPIP_GMX_RX_PRT_INFO_DROP	GENMASK_ULL(19, 16)
+#define OPIP_GMX_RX_PRT_INFO_COMMIT	GENMASK_ULL(3, 0)
+
+/*
+ * GMX_RX_BP_ONn, GMX_RX_BP_OFFn, GMX_RX_BP_DROPn: FIFO marks in 16 byte units
+ */
+#define OPIP_GMX_RX_BP_ON_MARK		GENMASK_ULL(8, 0)
+#define OPIP_GMX_RX_BP_MARK		GENMASK_ULL(5, 0)
+
+/* GMX_TX_INT_REG */
+#define OPIP_GMX_TX_INT_UNDFLW		GENMASK_ULL(5, 2)
+#define OPIP_GMX_TX_INT_PKO_NXA		BIT_ULL(0)
 
 /* GMX_TX_PRTS, GMX_RX_PRTS */
 #define OPIP_GMX_TX_PRTS_PRTS		GENMASK_ULL(4, 0)
@@ -190,11 +250,21 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PIP_BASE		0x00011800A0000000ull
 
 #define OPIP_PIP_REG(off)		OPIP_CSR(OPIP_PIP_BASE + (off))
+#define OPIP_PIP_STAT_CTL		OPIP_PIP_REG(0x018)
 #define OPIP_PIP_SFT_RST		OPIP_PIP_REG(0x030)
 #define OPIP_PIP_FRM_LEN_CHK(n)		OPIP_PIP_REG(0x180 + (n) * 8)
 #define OPIP_PIP_PRT_CFG(p)		OPIP_PIP_REG(0x200 + (p) * 8)
 #define OPIP_PIP_PRT_TAG(p)		OPIP_PIP_REG(0x400 + (p) * 8)
+#define OPIP_PIP_STAT_PRT(n, p)		OPIP_PIP_REG(0x800 + (n) * 8 + (p) * 80)
+#define OPIP_PIP_STAT_INB_PKTS(p)	OPIP_PIP_REG(0x1A00 + (p) * 32)
+#define OPIP_PIP_STAT_INB_OCTS(p)	OPIP_PIP_REG(0x1A08 + (p) * 32)
+/* CN68XX: the counters per port kind, the same fields */
+#define OPIP_PIP_STAT_INB_PKTS_PKND(k)	OPIP_PIP_REG(0x20000 + (k) * 32)
+#define OPIP_PIP_STAT_INB_OCTS_PKND(k)	OPIP_PIP_REG(0x20008 + (k) * 32)
+#define OPIP_PIP_STAT_PKND(n, k)	\
+	OPIP_PIP_REG(0x40000 + (n) * 8 + (k) * 128)
 
+#define OPIP_PIP_STAT_CTL_RDCLR		BIT_ULL(0)
 #define OPIP_PIP_SFT_RST_RST		BIT_ULL(0)
 
 /* PIP_FRM_LEN_CHKn */
@@ -234,6 +304,12 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PIP_PRT_TAG_NON_TAG_TYPE	GENMASK_ULL(5, 4)
 #define OPIP_PIP_PRT_TAG_GRP		GENMASK_ULL(3, 0)
 
+/* PIP_STATn_PRTm and PIP_STATn_X, the two 32-bit halves */
+#define OPIP_PIP_STAT_HI		GENMASK_ULL(63, 32)
+#define OPIP_PIP_STAT_LO		GENMASK_ULL(31, 0)
+#define OPIP_PIP_STAT1_OCTS		GENMASK_ULL(47, 0)
+#define OPIP_PIP_STAT_INB_OCTS_OCTS	GENMASK_ULL(47, 0)
+
 /* ------------------------------------------------------------------ */
 /* IPD: packet input data, the buffers and work queue entries */
 
@@ -256,6 +332,7 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_IPD_RED_QUE_PARAM(q)	OPIP_IPD_REG(0x2E0 + (q) * 8)
 #define OPIP_IPD_PTR_COUNT		OPIP_IPD_REG(0x320)
 #define OPIP_IPD_BP_PRT_RED_END		OPIP_IPD_REG(0x328)
+#define OPIP_IPD_QUE0_FREE_PAGE_CNT	OPIP_IPD_REG(0x330)
 #define OPIP_IPD_PWP_PTR_FIFO_CTL	OPIP_IPD_REG(0x340)
 #define OPIP_IPD_PRC_HOLD_PTR_FIFO_CTL	OPIP_IPD_REG(0x348)
 #define OPIP_IPD_PRC_PORT_PTR_FIFO_CTL	OPIP_IPD_REG(0x350)
@@ -373,6 +450,8 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PKO_MEM_QUEUE_PTRS		OPIP_PKO_REG(0x1000)
 #define OPIP_PKO_MEM_IPORT_PTRS		OPIP_PKO_REG(0x1030)
 #define OPIP_PKO_MEM_IQUEUE_PTRS	OPIP_PKO_REG(0x1040)
+#define OPIP_PKO_MEM_COUNT0		OPIP_PKO_REG(0x1080)
+#define OPIP_PKO_MEM_COUNT1		OPIP_PKO_REG(0x1088)
 #define OPIP_PKO_MEM_DEBUG7		OPIP_PKO_REG(0x1138)
 #define OPIP_PKO_MEM_DEBUG8		OPIP_PKO_REG(0x1140)
 #define OPIP_PKO_MEM_DEBUG9		OPIP_PKO_REG(0x1148)
@@ -428,6 +507,10 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PKO_MEM_IQUEUE_PTRS_IPID		GENMASK_ULL(14, 8)
 #define OPIP_PKO_MEM_IQUEUE_PTRS_QID		GENMASK_ULL(7, 0)
 
+/* PKO_MEM_COUNT0/1, the counters of the port PKO_REG_READ_IDX names */
+#define OPIP_PKO_MEM_COUNT0_COUNT	GENMASK_ULL(31, 0)
+#define OPIP_PKO_MEM_COUNT1_COUNT	GENMASK_ULL(47, 0)
+
 /*
  * PKO_MEM_DEBUG8 (DEBUG9 on CN3XXX): the doorbell count of the queue
  * PKO_REG_READ_IDX names, the command words the PKO has yet to fetch
@@ -458,13 +541,27 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_POW_REG(off)		OPIP_CSR(OPIP_POW_BASE + (off))
 #define OPIP_POW_PP_GRP_MSK(core)	OPIP_POW_REG(0x0000 + (core) * 8)
 #define OPIP_POW_WQ_INT_THR(grp)	OPIP_POW_REG(0x0080 + (grp) * 8)
+#define OPIP_POW_WQ_INT_CNT(grp)	OPIP_POW_REG(0x0100 + (grp) * 8)
 #define OPIP_POW_WQ_INT			OPIP_POW_REG(0x0200)
 #define OPIP_POW_WQ_INT_PC		OPIP_POW_REG(0x0208)
+#define OPIP_POW_IQ_CNT(qos)		OPIP_POW_REG(0x0340 + (qos) * 8)
+#define OPIP_POW_IQ_COM_CNT		OPIP_POW_REG(0x0388)
 #define OPIP_SSO_WQ_INT			OPIP_POW_REG(0x1000)
 #define OPIP_SSO_WQ_IQ_DIS		OPIP_POW_REG(0x1010)
 #define OPIP_SSO_WQ_INT_PC		OPIP_POW_REG(0x1020)
+#define OPIP_SSO_IQ_COM_CNT		OPIP_POW_REG(0x1058)
 #define OPIP_SSO_PP_GRP_MSK(core)	OPIP_POW_REG(0x6000 + (core) * 8)
 #define OPIP_SSO_WQ_INT_THR(grp)	OPIP_POW_REG(0x7000 + (grp) * 8)
+#define OPIP_SSO_WQ_INT_CNT(grp)	OPIP_POW_REG(0x8000 + (grp) * 8)
+#define OPIP_SSO_IQ_CNT(qos)		OPIP_POW_REG(0x9000 + (qos) * 8)
+
+/*
+ * POW_WQ_INT_CNTn: the entries queued for group n (IQ_CNT). POW_IQ_CNTn
+ * counts the input queue of QOS level n (the driver gives a port the QOS
+ * level port & 7), and POW_IQ_COM_CNT all of them.
+ */
+#define OPIP_POW_WQ_INT_CNT_IQ_CNT	GENMASK_ULL(11, 0)
+#define OPIP_POW_IQ_CNT_IQ_CNT		GENMASK_ULL(31, 0)
 
 #define OPIP_POW_PP_GRP_MSK_GRP_MSK	GENMASK_ULL(15, 0)
 #define OPIP_POW_WQ_INT_THR_TC_EN	BIT_ULL(28)

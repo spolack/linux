@@ -94,6 +94,22 @@ do {									\
 			    port, ##__VA_ARGS__);			\
 } while (0)
 
+/* Count a dropped packet whose error the PIP's counters do not have */
+static void opip_rx_count_error(struct net_device *dev, unsigned int err)
+{
+	struct opip_port *p;
+
+	if (!dev || (err >= OPIP_RCV_ERR_OVER_FCS && err <= OPIP_RCV_ERR_UNDER))
+		return;
+	p = opip_port(dev);
+	if (err == OPIP_RCV_ERR_JABBER)
+		atomic_long_inc(&p->rx_jabber);
+	else if (err == OPIP_RCV_ERR_LENGTH)
+		atomic_long_inc(&p->rx_l2_length);
+	else
+		atomic_long_inc(&p->rx_other_errors);
+}
+
 /*
  * A packet with a receive error. Minimum size frames with a length error
  * pass: some equipment pads to 64 + 4 FCS instead of 60 + 4.
@@ -112,6 +128,7 @@ static noinline __cold bool opip_rx_check_error(struct opip_wqe *wqe,
 		return false;
 
 	opip_rx_dbg(dev, port, "receive error code %u, packet dropped\n", err);
+	opip_rx_count_error(dev, err);
 	opip_rx_free_work(wqe);
 	return true;
 }
