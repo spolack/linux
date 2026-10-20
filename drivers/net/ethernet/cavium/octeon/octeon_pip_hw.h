@@ -80,6 +80,20 @@ static inline void opip_fpa_free_nosync(void *buf, int pool,
 	cvmx_fpa_free_nosync(buf, pool, lines);
 }
 
+/*
+ * A 32 bit FAU register: the PKO's packet counter of a queue, see
+ * opip_fau_addr()
+ */
+static inline u32 opip_fau_rd32(u64 addr)
+{
+	return cvmx_read64_int32(addr);
+}
+
+static inline void opip_fau_wr32(u64 addr, u32 val)
+{
+	cvmx_write64_int32(addr, val);
+}
+
 static inline u64 opip_phys(const void *ptr)
 {
 	return cvmx_ptr_to_phys((void *)ptr);
@@ -88,6 +102,15 @@ static inline u64 opip_phys(const void *ptr)
 static inline void *opip_virt(u64 phys)
 {
 	return cvmx_phys_to_ptr(phys);
+}
+
+/*
+ * The physical address of a pointer into XKPHYS, where the packet buffers
+ * and the skb data are: a mask, without the segment tests of opip_phys()
+ */
+static inline u64 opip_xkphys_to_phys(const void *ptr)
+{
+	return XKPHYS_TO_PHYS((uintptr_t)ptr);
 }
 
 /* An IOBDMA command: the hardware answers into the core's scratch memory */
@@ -317,6 +340,16 @@ static inline u64 opip_buf_start(u64 buf)
 	return ((opip_buf_addr(buf) >> 7) - FIELD_GET(OPIP_BUF_BACK, buf)) << 7;
 }
 
+static inline u64 opip_buf_build(u64 addr, unsigned int size, int pool,
+				 unsigned int back, bool i)
+{
+	return FIELD_PREP(OPIP_BUF_ADDR, addr) |
+	       FIELD_PREP(OPIP_BUF_SIZE, size) |
+	       FIELD_PREP(OPIP_BUF_POOL, pool) |
+	       FIELD_PREP(OPIP_BUF_BACK, back) |
+	       (i ? OPIP_BUF_I : 0);
+}
+
 /*
  * The link pointer to a packet's next buffer sits in the eight bytes
  * before a buffer's data; a buffer holds that much less data
@@ -328,5 +361,17 @@ static inline u64 opip_buf_next(u64 buf)
 {
 	return *(u64 *)opip_virt(opip_buf_addr(buf) - OPIP_BUF_LINK_SIZE);
 }
+
+/* The first word of a PKO command */
+#define OPIP_PKO_CMD_SIZE0	GENMASK_ULL(61, 60)
+#define OPIP_PKO_CMD_SUBONE0	BIT_ULL(47)
+#define OPIP_PKO_CMD_REG0	GENMASK_ULL(46, 36)
+#define OPIP_PKO_CMD_LE		BIT_ULL(35)
+#define OPIP_PKO_CMD_N2		BIT_ULL(34)
+#define OPIP_PKO_CMD_GATHER	BIT_ULL(31)
+#define OPIP_PKO_CMD_IPOFFP1	GENMASK_ULL(30, 24)
+#define OPIP_PKO_CMD_DONTFREE	BIT_ULL(22)
+#define OPIP_PKO_CMD_SEGS	GENMASK_ULL(21, 16)
+#define OPIP_PKO_CMD_TOTAL_BYTES	GENMASK_ULL(15, 0)
 
 #endif /* OCTEON_PIP_HW_H */

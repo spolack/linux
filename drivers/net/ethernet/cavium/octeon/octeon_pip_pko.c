@@ -259,6 +259,120 @@ void opip_pko_init(struct opip *opip)
 }
 
 /**
+ * opip_pko_queue_init - give a port's queue its first chunk and tell the PKO
+ * @opip:       The complex
+ * @txq:        The transmit queue, its queue number set
+ * @port:       PKO port
+ * @index:      Index of the queue among the port's
+ * @num_queues: Queues of the port
+ *
+ * Every queue gets the same share of the port (priority 8 of 8), none is
+ * static but the single queue of a CN68XX port, as the executive sets it,
+ * and its FAU counter is reset. Called with the PKO disabled.
+ *
+ * Return: 0, or -ENOMEM without a chunk
+ */
+int opip_pko_queue_init(struct opip *opip, struct opip_txq *txq, int port,
+			int index, int num_queues)
+{
+	u64 *chunk = opip_fpa_alloc(OPIP_POOL_CMD);
+
+	if (!chunk)
+		return -ENOMEM;
+	txq->chunk = chunk;
+	txq->index = 0;
+	/* The sent packet count of the queue starts at zero */
+	txq->fau = opip_fau_addr(opip_pko_queue_fau(txq->queue), 0);
+	opip_fau_wr32(txq->fau | OPIP_FAU_NOADD, 0);
+	wmb();	/* the chunk is in memory before the PKO is pointed at it */
+
+	if (opip_chip->cn68xx) {
+		opip_wr(OPIP_PKO_MEM_IQUEUE_PTRS,
+			FIELD_PREP(OPIP_PKO_MEM_IQUEUE_PTRS_INDEX, index) |
+			FIELD_PREP(OPIP_PKO_MEM_IQUEUE_PTRS_QID, txq->queue) |
+			FIELD_PREP(OPIP_PKO_MEM_IQUEUE_PTRS_IPID, port) |
+			(index == num_queues - 1 ?
+			 OPIP_PKO_MEM_IQUEUE_PTRS_TAIL : 0) |
+			OPIP_PKO_MEM_IQUEUE_PTRS_STATIC_P |
+			OPIP_PKO_MEM_IQUEUE_PTRS_STATIC_Q |
+			FIELD_PREP(OPIP_PKO_MEM_IQUEUE_PTRS_QOS_MASK, 0xff) |
+			FIELD_PREP(OPIP_PKO_MEM_IQUEUE_PTRS_BUF_PTR,
+				   opip_phys(chunk) >> 7));
+	} else {
+		u64 ptrs = (index == num_queues - 1 ?
+			    OPIP_PKO_MEM_QUEUE_PTRS_TAIL : 0) |
+			   FIELD_PREP(OPIP_PKO_MEM_QUEUE_PTRS_PORT, port) |
+			   FIELD_PREP(OPIP_PKO_MEM_QUEUE_PTRS_QOS_MASK, 0xff) |
+			   FIELD_PREP(OPIP_PKO_MEM_QUEUE_PTRS_BUF_PTR,
+				      opip_phys(chunk));
+
+		opip_pko_write_queue_ptrs(txq->queue, index, ptrs);
+	}
+	return 0;
+}
+
+/**
+ * opip_pko_queue_release - take a queue away from the PKO and free its chunk
+ * @opip: The complex
+ * @txq:  The transmit queue, the PKO done with it
+ *
+ * The PKO is stopped, or runs with no command of the queue left: a
+ * device that failed to register. A queue without a chunk was never
+ * given to the PKO: nothing to do.
+ */
+void opip_pko_queue_release(struct opip *opip, struct opip_txq *txq)
+{
+	if (!txq->chunk)
+		return;
+	if (!opip_chip->cn68xx)
+		opip_pko_queue_unused(txq->queue);
+	opip_fpa_free(txq->chunk, OPIP_POOL_CMD, 0);
+	txq->chunk = NULL;
+}
+
+/**
+ * opip_pko_write_next - the slow path of opip_pko_write(): the chunk is full
+ * @txq: The transmit queue, under its lock
+ * @w0:  Command word
+ * @w1:  Buffer pointer, or the pointer to a gather list
+ *
+ * Return: false if no chunk could be had, nothing written
+ */
+bool opip_pko_write_next(struct opip_txq *txq, u64 w0, u64 w1)
+{
+	u64 *chunk = opip_fpa_alloc(OPIP_POOL_CMD);
+
+	/* Commands start at even words: a full chunk ends at a command */
+	BUILD_BUG_ON(OPIP_PKO_CHUNK_WORDS % 2);
+	if (unlikely(!chunk))
+		return false;
+	/* The word after the commands links to the next chunk */
+	txq->chunk[OPIP_PKO_CHUNK_WORDS] = opip_phys(chunk);
+	txq->chunk = chunk;
+	chunk[0] = w0;
+	chunk[1] = w1;
+	txq->index = 2;
+	return true;
+}
+
+/**
+ * opip_pko_enable - start the PKO
+ *
+ * Sets ENA_PKO in PKO_REG_FLAGS, with ENA_DWB and STORE_BE. Nothing to do
+ * if the PKO is enabled already.
+ */
+void opip_pko_enable(void)
+{
+	u64 flags = opip_rd(OPIP_PKO_REG_FLAGS);
+
+	if (flags & OPIP_PKO_REG_FLAGS_ENA_PKO)
+		return;
+	/* Big endian storage of the commands, don't write back */
+	opip_wr(OPIP_PKO_REG_FLAGS, flags | OPIP_PKO_REG_FLAGS_ENA_PKO |
+		OPIP_PKO_REG_FLAGS_ENA_DWB | OPIP_PKO_REG_FLAGS_STORE_BE);
+}
+
+/**
  * opip_pko_disable - stop the PKO
  *
  * Clears ENA_PKO in PKO_REG_FLAGS. The PKO stops taking new commands but

@@ -46,6 +46,15 @@ static inline void opip_wr(u64 addr, u64 val)
 {
 }
 
+static inline u32 opip_fau_rd32(u64 addr)
+{
+	return 0;
+}
+
+static inline void opip_fau_wr32(u64 addr, u32 val)
+{
+}
+
 static inline void *opip_fpa_alloc(int pool)
 {
 	return NULL;
@@ -93,6 +102,11 @@ static inline u64 opip_phys(const void *ptr)
 static inline void *opip_virt(u64 phys)
 {
 	return phys_to_virt(phys);
+}
+
+static inline u64 opip_xkphys_to_phys(const void *ptr)
+{
+	return virt_to_phys((void *)ptr);
 }
 
 static inline unsigned int opip_core(void)

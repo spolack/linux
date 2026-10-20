@@ -370,6 +370,7 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PKO_REG_QUEUE_PTRS1	OPIP_PKO_REG(0x0100)
 #define OPIP_PKO_MEM_QUEUE_PTRS		OPIP_PKO_REG(0x1000)
 #define OPIP_PKO_MEM_IPORT_PTRS		OPIP_PKO_REG(0x1030)
+#define OPIP_PKO_MEM_IQUEUE_PTRS	OPIP_PKO_REG(0x1040)
 
 /* PKO_REG_FLAGS */
 #define OPIP_PKO_REG_FLAGS_RESET	BIT_ULL(3)
@@ -406,7 +407,20 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_PKO_MEM_IPORT_PTRS_INTR		GENMASK_ULL(20, 16)
 #define OPIP_PKO_MEM_IPORT_PTRS_EID		GENMASK_ULL(12, 8)
 #define OPIP_PKO_MEM_IPORT_PTRS_IPID		GENMASK_ULL(6, 0)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_STATIC_P	BIT_ULL(62)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_STATIC_Q	BIT_ULL(61)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_QOS_MASK	GENMASK_ULL(60, 53)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_BUF_PTR	GENMASK_ULL(52, 22)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_TAIL		BIT_ULL(21)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_INDEX		GENMASK_ULL(20, 16)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_IPID		GENMASK_ULL(14, 8)
+#define OPIP_PKO_MEM_IQUEUE_PTRS_QID		GENMASK_ULL(7, 0)
+
 /* PKO_REG_MIN_PKT: eight minimum sizes, a byte each */
+
+/* The doorbell address: port and queue in the I/O address */
+#define OPIP_PKO_DOORBELL_PORT		GENMASK_ULL(17, 12)
+#define OPIP_PKO_DOORBELL_QUEUE		GENMASK_ULL(11, 3)
 
 /* ------------------------------------------------------------------ */
 /* POW (SSO on CN68XX): the work scheduler */
@@ -444,6 +458,18 @@ static inline u64 opip_pcs_reg(int iface, int index, u64 off)
 #define OPIP_POW_IOBDMA_LEN		GENMASK_ULL(55, 48)
 #define OPIP_POW_IOBDMA_DID		GENMASK_ULL(47, 40)
 #define OPIP_POW_IOBDMA_WAIT		BIT_ULL(3)
+
+/*
+ * The FAU (fetch and add unit): 2 KB of counters in the IOB. A 32 bit load
+ * from the register's address returns it and adds INEVAL; a 32 bit store
+ * adds the data, or sets the register with NOADD. The PKO subtracts from
+ * one per sent packet when the command names it (OPIP_PKO_CMD_REG0).
+ */
+#define OPIP_FAU_DID			0xF0
+#define OPIP_FAU_INEVAL			GENMASK_ULL(35, 14)
+#define OPIP_FAU_NOADD			BIT_ULL(13)
+#define OPIP_FAU_SIZE_32		2	/* PKO command SIZE0/1 */
+#define OPIP_FAU_REG			GENMASK_ULL(10, 0)
 
 /* ------------------------------------------------------------------ */
 /* FPA: the buffer pools */

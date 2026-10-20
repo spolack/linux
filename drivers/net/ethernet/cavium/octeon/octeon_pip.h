@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/cache.h>
 #include <linux/ethtool.h>
+#include <linux/hrtimer.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
 #include <linux/mutex.h>
@@ -73,11 +74,67 @@ struct platform_device;
 /* PKO output queues: the most a port can have */
 #define OPIP_MAX_TXQS		16
 
+/*
+ * Packets a transmit queue may hand to the PKO before it is stopped, and
+ * the ring that holds them (a power of two with room for the stop margin)
+ */
+#define OPIP_TXQ_DEPTH		256
+#define OPIP_TXQ_RING		(2 * OPIP_TXQ_DEPTH)
+
 /* Ethernet header, FCS and a VLAN tag on top of the MTU */
 #define OPIP_MTU_OVERHEAD	(ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN)
 #define OPIP_MAX_FRAME		65392
 
 /* ------------------------------------------------------------------ */
+
+/*
+ * A transmit queue: one PKO output queue of a port, with the chunk of
+ * command words the driver writes for it. Everything that touches it runs
+ * under the netdev queue lock: xmit and its transmit NAPI. The PKO counts
+ * the packets it has sent in the queue's FAU register; the completion
+ * compares the count with the ring and frees from the head.
+ */
+struct opip_txq {
+	/* The command chunk being written, and the words used in it */
+	u64 *chunk;
+	unsigned int index;
+	/* PKO output queue number */
+	int queue;
+	/* The address of the FAU register the PKO counts the sent packets in */
+	u64 fau;
+	/*
+	 * The packets the PKO has, in the order of their commands. The
+	 * transmit side adds at the tail; the completions take from the head.
+	 * The difference is what is in flight.
+	 */
+	unsigned int tail;
+	unsigned int head;
+	/* Command words written but not yet announced by a doorbell */
+	unsigned int doorbell;
+	/*
+	 * Packets written since the counter was last read or the queue's
+	 * NAPI was scheduled for it, see opip_tx_complete()
+	 */
+	unsigned int written;
+	/*
+	 * Schedules the NAPI for what is left in flight when nothing else
+	 * completes it
+	 */
+	struct hrtimer timer;
+	struct net_device *dev;
+	unsigned int qid;
+	/* Statistics, see octeon_pip_ethtool.c */
+	unsigned long linearized;
+	unsigned long no_wqe;
+	unsigned long no_chunk;
+	unsigned long stopped;
+	unsigned long ring[OPIP_TXQ_RING];
+	/*
+	 * Completes the queue outside of the receive polls, so that every
+	 * completion runs in a NAPI poll, see opip_tx_napi_poll()
+	 */
+	struct napi_struct napi;
+} ____cacheline_aligned_in_smp;
 
 /* An interface: a GMX, NPI or LOOP block with up to 16 ports */
 struct opip_iface {
@@ -98,9 +155,13 @@ struct opip_port {
 	/* IPD/PKO port number, and the index on the interface */
 	int port;
 	int index;
+	/* The first PKO output queue, and how many the port has */
+	int base_queue;
+	int num_queues;
 	phy_interface_t		phy_mode;
 	struct work_struct	rx_mode_work;
 	struct device_node	*of_node;
+	struct opip_txq		txq[OPIP_MAX_TXQS];
 	struct phylink		*phylink;
 	struct phylink_config	phylink_config;
 	/* The PCS of an SGMII port */

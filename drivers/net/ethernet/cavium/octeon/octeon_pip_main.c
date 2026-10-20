@@ -40,6 +40,13 @@
 /* PKO command chunks put in the chunk pool */
 #define OPIP_NUM_CMD_CHUNKS	1024
 
+/*
+ * Command chunks a full transmit queue takes: two words a packet, the
+ * usable words of a chunk, and one more for the chunk the PKO still reads.
+ */
+#define OPIP_TXQ_CMD_CHUNKS \
+	(DIV_ROUND_UP(OPIP_TXQ_DEPTH * 2, OPIP_PKO_CHUNK_WORDS) + 1)
+
 /* ------------------------------------------------------------------ */
 /* The link of a port, from the blocks that make it */
 
@@ -252,13 +259,16 @@ static int opip_ndo_init(struct net_device *dev)
 	unsigned int i;
 
 	/*
-	 * Receive queue i is group i, whose NAPI is on opip->napi_dev and
-	 * outlives the registration.
+	 * Receive queue i is group i, whose NAPI is on opip->napi_dev; each
+	 * transmit queue has its own. Both outlive the registration.
 	 */
 	for (i = 0; i < OPIP_MAX_GROUPS; i++)
 		if (p->opip->groups_mask & BIT(i))
 			netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_RX,
 					     &p->opip->groups[i].napi);
+	for (i = 0; i < dev->real_num_tx_queues; i++)
+		netif_queue_set_napi(dev, i, NETDEV_QUEUE_TYPE_TX,
+				     &p->txq[i].napi);
 
 	opip_set_mac_filter(dev);
 	opip_set_hw_mtu(dev, dev->mtu);
@@ -271,6 +281,8 @@ static int opip_ndo_open(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
 	int ret;
+
+	opip_tx_resume(dev);
 
 	/* NPI and LOOP: no MAC or link to bring up */
 	if (!opip_iface_is_gmx(p->iface))
@@ -285,6 +297,7 @@ static int opip_ndo_open(struct net_device *dev)
 	ret = phylink_of_phy_connect(p->phylink, p->of_node, 0);
 	if (ret) {
 		netdev_err(dev, "could not attach the PHY: %d\n", ret);
+		opip_tx_stop(dev);
 		return ret;
 	}
 	opip_port_enable(p, true);
@@ -296,8 +309,16 @@ static int opip_ndo_stop(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
 
-	if (!opip_iface_is_gmx(p->iface))
+	if (!opip_iface_is_gmx(p->iface)) {
+		/* The packets in flight reference the device */
+		opip_tx_drain(dev);
+		opip_tx_stop(dev);
 		return 0;
+	}
+
+	/* The stack no longer transmits: the PKO sends what it has */
+	opip_tx_drain(dev);
+	opip_tx_stop(dev);
 
 	/*
 	 * With the MAC still on: the link goes down through mac_link_down(),
@@ -325,6 +346,7 @@ static const struct net_device_ops opip_netdev_ops = {
 	.ndo_open		= opip_ndo_open,
 	.ndo_stop		= opip_ndo_stop,
 	.ndo_start_xmit		= opip_xmit,
+	.ndo_features_check	= opip_features_check,
 	.ndo_set_rx_mode	= opip_set_rx_mode,
 	.ndo_set_mac_address	= opip_set_mac_address,
 	.ndo_eth_ioctl		= opip_ioctl,
@@ -384,20 +406,71 @@ static void opip_sgmii_phy_mode(struct opip_port *p)
 			 phy_modes(p->phy_mode));
 }
 
-/* Release what opip_alloc_port() took */
+/*
+ * Give every CPU its own transmit queue: queue n gets the CPUs whose
+ * number modulo the queue count is n.
+ */
+static void opip_setup_xps(struct net_device *dev)
+{
+	unsigned int num_queues = dev->real_num_tx_queues, qid;
+	cpumask_var_t mask;
+	int cpu;
+
+	if (num_queues < 2 || !zalloc_cpumask_var(&mask, GFP_KERNEL))
+		return;
+	for (qid = 0; qid < num_queues; qid++) {
+		cpumask_clear(mask);
+		for_each_possible_cpu(cpu)
+			if (cpu % num_queues == qid)
+				cpumask_set_cpu(cpu, mask);
+		netif_set_xps_queue(dev, mask, qid);
+	}
+	free_cpumask_var(mask);
+}
+
+/*
+ * Release what opip_alloc_port() took. The device's own queue count is
+ * gone once it is unregistered: the port's is used. A drain that gave up
+ * left packets in the queues, the PKO reset since: free them. Lost are
+ * the chunks the PKO still held but the current one; the pool's count
+ * warns of them.
+ */
 static void opip_put_port(struct net_device *dev)
 {
 	struct opip_port *p = opip_port(dev);
+	int qid;
 
 	if (p->phylink)
 		phylink_destroy(p->phylink);
+	for (qid = 0; qid < p->num_queues; qid++) {
+		opip_txq_free(&p->txq[qid]);
+		opip_txq_purge(&p->txq[qid]);
+		opip_pko_queue_release(p->opip, &p->txq[qid]);
+	}
 	of_node_put(p->of_node);
 	free_netdev(dev);
 }
 
 /*
- * A net_device for a port, with phylink created. Failures only cost the
- * port.
+ * A fragmented packet in flight holds a gather list in a buffer of the
+ * WQE pool until the PKO has sent it, so grow the pool by what the
+ * transmit queues of the device can hold before it can send, leaving the
+ * receive side its share. The same for the command chunks that full
+ * queues take up.
+ */
+static void opip_port_grow_pools(struct opip *opip, struct net_device *dev)
+{
+	unsigned int queues = dev->real_num_tx_queues;
+
+	opip->wqe_bufs += opip_fpa_fill(opip, OPIP_POOL_WQE, OPIP_POOL_WQE_SIZE,
+					queues * OPIP_TXQ_DEPTH);
+	opip->cmd_bufs += opip_fpa_fill(opip, OPIP_POOL_CMD, OPIP_POOL_CMD_SIZE,
+					queues * OPIP_TXQ_CMD_CHUNKS);
+}
+
+/*
+ * A net_device for a port, with its queues set up at the PKO (which is
+ * still disabled) and phylink created. Failures only cost the port.
  */
 static struct net_device *opip_alloc_port(struct opip *opip,
 					  struct device_node *pip,
@@ -407,7 +480,7 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	const char *name = "eth%d";
 	struct net_device *dev;
 	struct device_node *np;
-	int num_queues;
+	int num_queues, qid;
 	struct opip_port *p;
 
 	/* Sending on a port without queues corrupts memory */
@@ -440,6 +513,8 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	p->netdev = dev;
 	p->port = port;
 	p->index = index;
+	p->base_queue = opip_pko_base_queue(opip, port);
+	p->num_queues = num_queues;
 	p->of_node = np;
 	dev->dev.of_node = np;
 	p->phy_mode = PHY_INTERFACE_MODE_NA;
@@ -449,9 +524,17 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	dev->min_mtu = VLAN_ETH_ZLEN - OPIP_MTU_OVERHEAD;
 	dev->max_mtu = OPIP_MAX_FRAME - OPIP_MTU_OVERHEAD;
 	dev->netdev_ops = &opip_netdev_ops;
-	dev->hw_features = NETIF_F_RXCSUM | NETIF_F_RXHASH;
+	/*
+	 * The gather list of a packet sits in its skb->cb and a transmit may
+	 * linearize or pad the skb: none may be sent again while in flight
+	 * (pktgen's clone_skb and burst)
+	 */
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+	dev->hw_features = NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_IP_CSUM |
+			   NETIF_F_IPV6_CSUM | NETIF_F_RXCSUM | NETIF_F_RXHASH;
 	dev->features |= dev->hw_features;
 	dev->vlan_features |= dev->hw_features;
+	dev->hw_enc_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
 
 	/*
 	 * opip_probe() has waited for the nvmem cells: a failure here is final
@@ -486,6 +569,19 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 	device_set_node(&dev->dev, of_fwnode_handle(np));
 	dev->dev_port = port;
 
+	/* The queues: the PKO's view of them and their first chunks */
+	for (qid = 0; qid < num_queues; qid++) {
+		struct opip_txq *q = &p->txq[qid];
+
+		q->queue = p->base_queue + qid;
+		opip_txq_init(dev, qid);
+		if (opip_pko_queue_init(opip, q, port, qid, num_queues)) {
+			dev_err(&opip->pdev->dev, "no command chunk for queue %d\n",
+				q->queue);
+			goto err_put;
+		}
+	}
+
 	if (opip_iface_is_gmx(iface) && !opip_on_simulator() &&
 	    opip_phylink_create(p)) {
 		dev_err(&opip->pdev->dev, "failed to set up the link of interface %d port %d\n",
@@ -493,6 +589,7 @@ static struct net_device *opip_alloc_port(struct opip *opip,
 		goto err_put;
 	}
 
+	opip_port_grow_pools(opip, dev);
 	return dev;
 
 err_put:
@@ -990,7 +1087,7 @@ static void opip_iface_disable_unused(struct opip *opip,
 			opip_gmx_port_enable(iface->num, index, false, 0);
 }
 
-/* Packet input on: the IPD, the interfaces */
+/* Packet input and output on: the IPD, the interfaces, the PKO */
 static void opip_input_enable(struct opip *opip)
 {
 	int i;
@@ -1002,6 +1099,7 @@ static void opip_input_enable(struct opip *opip)
 		opip_iface_enable(opip, &opip->ifaces[i]);
 		opip_iface_disable_unused(opip, &opip->ifaces[i]);
 	}
+	opip_pko_enable();
 }
 
 /*
@@ -1101,6 +1199,7 @@ static int opip_register_ports(struct opip *opip)
 			opip_put_port(dev);
 			continue;
 		}
+		opip_setup_xps(dev);
 		num++;
 	}
 	return num;
