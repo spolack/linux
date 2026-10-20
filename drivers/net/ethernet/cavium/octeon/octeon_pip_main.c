@@ -13,6 +13,7 @@
  * Copyright (c) 2003-2018 Cavium, Inc. / Cavium Networks.
  */
 
+#include <linux/delay.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -22,8 +23,12 @@
 #include "octeon_pip.h"
 #include "octeon_pip_fpa.h"
 #include "octeon_pip_ipd.h"
+#include "octeon_pip_pko.h"
 #include "octeon_pip_pow.h"
 #include "octeon_pip_regs.h"
+
+/* PKO command chunks put in the chunk pool */
+#define OPIP_NUM_CMD_CHUNKS	1024
 
 static const char * const opip_mode_names[] = {
 	"DISABLED", "RGMII", "GMII", "SPI", "PCIE", "XAUI", "SGMII", "PICMG",
@@ -141,6 +146,12 @@ static void opip_hw_takeover(struct opip *opip)
 	u64 old_mask;
 
 	opip_ipd_disable();
+	if (opip_rd(OPIP_PKO_REG_FLAGS) & OPIP_PKO_REG_FLAGS_ENA_PKO) {
+		/* It finishes the packets it is sending, see opip_pko_stop() */
+		opip_pko_disable();
+		msleep(20);
+	}
+	opip_pko_reset();
 	opip_fpa_enable();
 	for (pool = OPIP_POOL_PACKET; pool <= OPIP_POOL_CMD; pool++)
 		while (opip_fpa_alloc(pool))
@@ -405,10 +416,18 @@ static int opip_hw_init(struct opip *opip)
 	/* Every received packet takes an entry; the ports add their share */
 	opip->wqe_bufs = opip_fpa_fill(opip, OPIP_POOL_WQE, OPIP_POOL_WQE_SIZE,
 				       opip->num_packet_buffers);
-	if (opip->wqe_bufs < opip->num_packet_buffers) {
+	opip->cmd_bufs = opip_fpa_fill(opip, OPIP_POOL_CMD, OPIP_POOL_CMD_SIZE,
+				       OPIP_NUM_CMD_CHUNKS);
+	if (opip->wqe_bufs < opip->num_packet_buffers ||
+	    opip->cmd_bufs < OPIP_NUM_CMD_CHUNKS) {
 		opip_fpa_empty(opip, OPIP_POOL_WQE, opip->wqe_bufs);
+		opip_fpa_empty(opip, OPIP_POOL_CMD, opip->cmd_bufs);
 		return -ENOMEM;
 	}
+
+	/* One output queue per CPU and port, as far as the chip has them */
+	opip_pko_layout(opip, min_t(int, num_possible_cpus(), OPIP_MAX_TXQS));
+	opip_pko_init(opip);
 
 	/*
 	 * One receive group per CPU, as far as a power of two goes: the PIP
@@ -445,14 +464,30 @@ static int opip_hw_init(struct opip *opip)
 /* Undo opip_hw_init() */
 static void opip_free_hw(struct opip *opip)
 {
+	opip_pko_reset();
 	/* The IPD's count of the packet pool is zero again with the pool */
 	opip_ipd_reset();
 	opip_fpa_empty(opip, OPIP_POOL_WQE, opip->wqe_bufs);
+	opip_fpa_empty(opip, OPIP_POOL_CMD, opip->cmd_bufs);
+}
+
+/*
+ * Disable the PKO. It stops taking new commands but finishes the packets
+ * it is sending: a 9 KB frame takes 8 ms at 10 Mbit/s. Give it the time,
+ * then reset it: a port held by PAUSE frames would keep it reading the
+ * buffers its queues still hold, which are taken away next.
+ */
+static void opip_pko_stop(void)
+{
+	opip_pko_disable();
+	msleep(20);
+	opip_pko_reset();
 }
 
 /* Take the driver down in the order its parts depend on each other */
 static void opip_teardown(struct opip *opip)
 {
+	opip_pko_stop();
 	opip_free_hw(opip);
 }
 

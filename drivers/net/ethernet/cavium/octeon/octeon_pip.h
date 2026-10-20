@@ -60,11 +60,15 @@ struct platform_device;
 #define OPIP_LATER_SKIP		0
 
 /* IPD/PKO ports: 16 per GMX interface, then the NPI and LOOP ports */
+#define OPIP_MAX_PORTS		48
 #define OPIP_MAX_IFACES		9
 #define OPIP_IFACE_PORTS	16
 
 /* The POW groups the driver can use, one per CPU */
 #define OPIP_MAX_GROUPS		16
+
+/* PKO output queues: the most a port can have */
+#define OPIP_MAX_TXQS		16
 
 /* ------------------------------------------------------------------ */
 
@@ -86,10 +90,13 @@ struct opip {
 	struct opip_iface ifaces[OPIP_MAX_IFACES];
 	/* The POW groups in use */
 	unsigned int groups_mask;
+	/* PKO output queues per port of the GMX interfaces */
+	int queues_per_port;
 	/* The hardware was released, by remove or by shutdown */
 	bool released;
 	/* What was put into the pools, to check what comes back */
 	unsigned int wqe_bufs;
+	unsigned int cmd_bufs;
 };
 
 /* The IPD/PKO port of a port on an interface */
