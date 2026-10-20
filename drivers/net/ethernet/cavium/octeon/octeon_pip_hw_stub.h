@@ -33,6 +33,20 @@ static inline void opip_wr(u64 addr, u64 val)
 {
 }
 
+static inline void *opip_fpa_alloc(int pool)
+{
+	return NULL;
+}
+
+static inline void opip_fpa_free(void *buf, int pool, unsigned int lines)
+{
+}
+
+static inline void opip_fpa_free_nosync(void *buf, int pool,
+					unsigned int lines)
+{
+}
+
 static inline int opip_num_interfaces(void)
 {
 	return 0;
@@ -41,6 +55,25 @@ static inline int opip_num_interfaces(void)
 static inline enum opip_mode opip_iface_mode(int iface)
 {
 	return OPIP_MODE_DISABLED;
+}
+
+static inline u64 opip_phys(const void *ptr)
+{
+	return virt_to_phys((void *)ptr);
+}
+
+static inline void *opip_virt(u64 phys)
+{
+	return phys_to_virt(phys);
+}
+
+static inline unsigned int opip_core(void)
+{
+	return raw_smp_processor_id();
+}
+
+static inline void opip_errata_qlm_cdr(void)
+{
 }
 
 #endif /* OCTEON_PIP_HW_STUB_H */

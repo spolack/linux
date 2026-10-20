@@ -35,7 +35,9 @@ enum opip_mode {
 
 #include <asm/octeon/octeon.h>
 #include <asm/octeon/cvmx-bootinfo.h>
+#include <asm/octeon/cvmx-fpa.h>
 #include <asm/octeon/cvmx-helper.h>
+#include <asm/octeon/cvmx-helper-errata.h>
 
 static inline u64 opip_rd(u64 addr)
 {
@@ -45,6 +47,43 @@ static inline u64 opip_rd(u64 addr)
 static inline void opip_wr(u64 addr, u64 val)
 {
 	cvmx_write_csr(addr, val);
+}
+
+static inline void *opip_fpa_alloc(int pool)
+{
+	return cvmx_fpa_alloc(pool);
+}
+
+/* Free with the write barrier the pool needs, see opip_fpa_free_nosync() */
+static inline void opip_fpa_free(void *buf, int pool, unsigned int lines)
+{
+	cvmx_fpa_free(buf, pool, lines);
+}
+
+/*
+ * Free without a barrier: for a buffer the CPU has not written, or when
+ * one barrier covers a batch of frees. @lines: cache lines of the buffer
+ * the hardware need not write back.
+ */
+static inline void opip_fpa_free_nosync(void *buf, int pool,
+					unsigned int lines)
+{
+	cvmx_fpa_free_nosync(buf, pool, lines);
+}
+
+static inline u64 opip_phys(const void *ptr)
+{
+	return cvmx_ptr_to_phys((void *)ptr);
+}
+
+static inline void *opip_virt(u64 phys)
+{
+	return cvmx_phys_to_ptr(phys);
+}
+
+static inline unsigned int opip_core(void)
+{
+	return cvmx_get_core_num();
 }
 
 /* The interfaces as the bootloader strapped them, from the arch */
@@ -69,6 +108,11 @@ static_assert((int)OPIP_MODE_LOOP == (int)CVMX_HELPER_INTERFACE_MODE_LOOP);
 static inline enum opip_mode opip_iface_mode(int iface)
 {
 	return (enum opip_mode)cvmx_helper_interface_get_mode(iface);
+}
+
+static inline void opip_errata_qlm_cdr(void)
+{
+	__cvmx_helper_errata_qlm_disable_2nd_order_cdr(1);
 }
 
 #else /* CONFIG_CAVIUM_OCTEON_SOC */

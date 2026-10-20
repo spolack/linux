@@ -31,9 +31,40 @@ struct platform_device;
 /* ------------------------------------------------------------------ */
 /* The hardware layout the driver chooses */
 
+/* The FPA pools: packet buffers, work queue entries, PKO command chunks */
+#define OPIP_POOL_PACKET	0
+#define OPIP_POOL_PACKET_SIZE	2048
+#define OPIP_POOL_WQE		1
+#define OPIP_POOL_WQE_SIZE	128
+#define OPIP_POOL_CMD		2
+#define OPIP_POOL_CMD_SIZE	1024
+
+/*
+ * The packet pool is the receive ring of all ports together (ethtool -g):
+ * this many buffers for each MAC port by default, at least a thousand,
+ * and at most what a page_pool recycles. RED starts to drop below a
+ * quarter of it free. 128 a port gives the 1024 of an eight port chip
+ * that the forwarding rates were measured with; whether a larger pool
+ * helps a board is a matter of one ethtool -G.
+ */
+#define OPIP_RX_RING_PER_PORT	128
+#define OPIP_DEFAULT_PACKET_BUFFERS	1024
+#define OPIP_MAX_PACKET_BUFFERS	16384
+
+/*
+ * The IPD skips this much of the first buffer of a packet: room for the
+ * link pointer the IPD writes just before the data, and headroom for the
+ * stack and XDP. Later buffers of a packet start with the link pointer.
+ */
+#define OPIP_FIRST_SKIP		256
+#define OPIP_LATER_SKIP		0
+
 /* IPD/PKO ports: 16 per GMX interface, then the NPI and LOOP ports */
 #define OPIP_MAX_IFACES		9
 #define OPIP_IFACE_PORTS	16
+
+/* The POW groups the driver can use, one per CPU */
+#define OPIP_MAX_GROUPS		16
 
 /* ------------------------------------------------------------------ */
 
@@ -49,8 +80,16 @@ struct opip_iface {
 /* The packet I/O complex */
 struct opip {
 	struct platform_device *pdev;
+	/* The size of the packet pool */
+	unsigned int num_packet_buffers;
 	int num_ifaces;
 	struct opip_iface ifaces[OPIP_MAX_IFACES];
+	/* The POW groups in use */
+	unsigned int groups_mask;
+	/* The hardware was released, by remove or by shutdown */
+	bool released;
+	/* What was put into the pools, to check what comes back */
+	unsigned int wqe_bufs;
 };
 
 /* The IPD/PKO port of a port on an interface */
@@ -61,6 +100,21 @@ static inline int opip_port_number(int iface, int index)
 	if (iface >= ARRAY_SIZE(base))
 		return -1;
 	return base[iface] + index;
+}
+
+/* A port of a GMX block: RGMII, GMII, (Q)SGMII, PICMG or XAUI */
+static inline bool opip_iface_is_gmx(const struct opip_iface *iface)
+{
+	switch (iface->mode) {
+	case OPIP_MODE_RGMII:
+	case OPIP_MODE_GMII:
+	case OPIP_MODE_SGMII:
+	case OPIP_MODE_PICMG:
+	case OPIP_MODE_XAUI:
+		return true;
+	default:
+		return false;
+	}
 }
 
 #endif /* OCTEON_PIP_H */

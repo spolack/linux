@@ -20,6 +20,9 @@
 #include <linux/slab.h>
 
 #include "octeon_pip.h"
+#include "octeon_pip_fpa.h"
+#include "octeon_pip_ipd.h"
+#include "octeon_pip_pow.h"
 #include "octeon_pip_regs.h"
 
 static const char * const opip_mode_names[] = {
@@ -78,7 +81,7 @@ static int opip_iface_ports(int iface, enum opip_mode mode)
  */
 static void opip_probe_ifaces(struct opip *opip)
 {
-	int i;
+	int i, index;
 
 	opip->num_ifaces = min(opip_num_interfaces(), OPIP_MAX_IFACES);
 	dev_dbg(&opip->pdev->dev, "%s, %d interfaces\n", opip_chip->name,
@@ -102,6 +105,14 @@ static void opip_probe_ifaces(struct opip *opip)
 				"interface %d is SPI-4.2, not supported\n", i);
 			iface->num_ports = 0;
 			break;
+		case OPIP_MODE_LOOP:
+			for (index = 0; index < 4; index++) {
+				int port = opip_port_number(i, index);
+
+				opip_pip_length_checks(port, false);
+				opip_ipd_fcs_strip(port, false);
+			}
+			break;
 		default:
 			break;
 		}
@@ -114,6 +125,42 @@ static void opip_probe_ifaces(struct opip *opip)
 
 /* ------------------------------------------------------------------ */
 /* Probe and remove */
+
+/*
+ * A kernel that crashed (kdump) or a driver without a shutdown may have
+ * left packet I/O running, and its buffers in the pools and the groups.
+ * Stop it and take them out without freeing them: they are not this
+ * kernel's. After the bootloader there is nothing to take. The IPD's
+ * FIFOs are not walked: the reset that follows drops what the IPD holds,
+ * and its port FIFO, walked whole, holds what any earlier user left.
+ */
+static void opip_hw_takeover(struct opip *opip)
+{
+	unsigned int core, n = 0;
+	int pool, group;
+	u64 old_mask;
+
+	opip_ipd_disable();
+	opip_fpa_enable();
+	for (pool = OPIP_POOL_PACKET; pool <= OPIP_POOL_CMD; pool++)
+		while (opip_fpa_alloc(pool))
+			n++;
+
+	/* The group mask is the core's own */
+	preempt_disable();
+	core = opip_core();
+	for (group = 0; group < OPIP_MAX_GROUPS; group++) {
+		old_mask = opip_pow_select_group(core, group);
+		while (opip_pow_request_sync(false))
+			n++;
+		opip_pow_restore_groups(core, old_mask);
+	}
+	preempt_enable();
+
+	if (n)
+		dev_warn(&opip->pdev->dev, "dropped %u buffers and work entries of an earlier owner\n",
+			 n);
+}
 
 const struct opip_chip *opip_chip __read_mostly;
 
@@ -316,13 +363,126 @@ static const struct opip_chip *opip_chip_find(void)
 	return NULL;
 }
 
+/*
+ * The packet I/O hardware the ports share, up to the receive groups.
+ * Return: 0, or -ENOMEM with the hardware idle and the pools empty
+ */
+static int opip_hw_init(struct opip *opip)
+{
+	int i, order, ports = 0;
+
+	/* CN52XX pass 1: a bug in the second order CDR, disable it */
+	if (OCTEON_IS_MODEL(OCTEON_CN52XX_PASS1_0))
+		opip_errata_qlm_cdr();
+
+	/*
+	 * The I/O blocks get priority over the cores at the L2: no starving.
+	 * L2C_CFG is CN3XXX/CN5XXX only: OCTEON II/III arbitrate in L2C_CTL,
+	 * which the bootloader sets.
+	 */
+	if (opip_chip->l2c_cfg)
+		opip_wr(OPIP_L2C_CFG, opip_rd(OPIP_L2C_CFG) &
+			~(OPIP_L2C_CFG_LRF_ARB_MODE |
+			  OPIP_L2C_CFG_RFB_ARB_MODE));
+
+	/*
+	 * Whatever the bootloader left: the IPD's count of the packet pool
+	 * starts at zero while the pool is empty, see opip_ipd_reset().
+	 */
+	opip_hw_takeover(opip);
+	opip_ipd_reset();
+	opip_fpa_enable();
+	opip_probe_ifaces(opip);
+
+	/* The packet pool by the MAC ports, see OPIP_RX_RING_PER_PORT */
+	for (i = 0; i < opip->num_ifaces; i++)
+		if (opip_iface_is_gmx(&opip->ifaces[i]))
+			ports += opip->ifaces[i].num_ports;
+	opip->num_packet_buffers = clamp(ports * OPIP_RX_RING_PER_PORT,
+					 OPIP_DEFAULT_PACKET_BUFFERS,
+					 OPIP_MAX_PACKET_BUFFERS);
+
+	/* Every received packet takes an entry; the ports add their share */
+	opip->wqe_bufs = opip_fpa_fill(opip, OPIP_POOL_WQE, OPIP_POOL_WQE_SIZE,
+				       opip->num_packet_buffers);
+	if (opip->wqe_bufs < opip->num_packet_buffers) {
+		opip_fpa_empty(opip, OPIP_POOL_WQE, opip->wqe_bufs);
+		return -ENOMEM;
+	}
+
+	/*
+	 * One receive group per CPU, as far as a power of two goes: the PIP
+	 * spreads the flows over them by a mask of the tag.
+	 */
+	order = min(ilog2(num_online_cpus()), 3);
+	opip->groups_mask = GENMASK((1 << order) - 1, 0);
+
+	opip_ipd_config();
+	opip_ipd_red_setup(opip->num_packet_buffers / 4,
+			   opip->num_packet_buffers / 8);
+	for (i = 0; i < opip->num_ifaces; i++) {
+		struct opip_iface *iface = &opip->ifaces[i];
+		int index;
+
+		for (index = 0; index < iface->num_ports; index++) {
+			int port = opip_port_number(i, index);
+
+			opip_pip_port_config(i, port, order);
+			/*
+			 * The bootloader leaves the backpressure counts
+			 * nonzero. Zero them now: with the packet pool empty
+			 * the IPD counts nothing and no poll subtracts.
+			 */
+			if ((iface->mode == OPIP_MODE_SGMII ||
+			     iface->mode == OPIP_MODE_PICMG) &&
+			    !opip_chip->cn68xx)
+				opip_ipd_bp_sub(port, opip_ipd_bp_count(port));
+		}
+	}
+	return 0;
+}
+
+/* Undo opip_hw_init() */
+static void opip_free_hw(struct opip *opip)
+{
+	/* The IPD's count of the packet pool is zero again with the pool */
+	opip_ipd_reset();
+	opip_fpa_empty(opip, OPIP_POOL_WQE, opip->wqe_bufs);
+}
+
+/* Take the driver down in the order its parts depend on each other */
+static void opip_teardown(struct opip *opip)
+{
+	opip_free_hw(opip);
+}
+
+static void opip_remove(struct platform_device *pdev)
+{
+	struct opip *opip = platform_get_drvdata(pdev);
+
+	if (opip->released)
+		return;
+	opip->released = true;
+	opip_teardown(opip);
+}
+
 static int opip_probe(struct platform_device *pdev)
 {
 	struct opip *opip;
+	int ret;
 
 	opip_chip = opip_chip_find();
 	if (!opip_chip) {
 		dev_err(&pdev->dev, "unknown chip\n");
+		return -ENODEV;
+	}
+	/*
+	 * Engineering samples: their IPD cannot give back the buffers it
+	 * holds, so the driver could never take its pools down again
+	 */
+	if (OCTEON_IS_MODEL(OCTEON_CN38XX_PASS1) ||
+	    OCTEON_IS_MODEL(OCTEON_CN38XX_PASS2)) {
+		dev_err(&pdev->dev, "CN38XX pass 1 and 2 are not supported\n");
 		return -ENODEV;
 	}
 
@@ -330,10 +490,24 @@ static int opip_probe(struct platform_device *pdev)
 	if (!opip)
 		return -ENOMEM;
 	opip->pdev = pdev;
+	platform_set_drvdata(pdev, opip);
 
-	opip_probe_ifaces(opip);
+	ret = opip_hw_init(opip);
+	if (ret)
+		return ret;
 
 	return 0;
+}
+
+/*
+ * Leave the packet hardware idle and its pools empty for whatever runs
+ * next, a kernel started by kexec or the bootloader: packet input would
+ * go on writing to buffers that belong to it, and the pools would hand it
+ * buffers of this kernel.
+ */
+static void opip_shutdown(struct platform_device *pdev)
+{
+	opip_remove(pdev);
 }
 
 static const struct of_device_id opip_match[] = {
@@ -344,6 +518,8 @@ MODULE_DEVICE_TABLE(of, opip_match);
 
 static struct platform_driver opip_driver = {
 	.probe		= opip_probe,
+	.remove		= opip_remove,
+	.shutdown	= opip_shutdown,
 	.driver		= {
 		.name	= KBUILD_MODNAME,
 		.of_match_table = opip_match,
