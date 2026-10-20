@@ -22,6 +22,7 @@ void opip_ipd_fcs_strip(int port, bool strip);
 unsigned int opip_ipd_bp_count(int port);
 void opip_pip_port_config(int iface, int port, unsigned int group_order);
 void opip_pip_length_checks(int port, bool enable);
+void opip_pip_frame_length(int n, unsigned int min, unsigned int max);
 
 /*
  * The IPD counts the packet buffers it fills per port and asserts

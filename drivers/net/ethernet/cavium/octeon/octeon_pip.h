@@ -70,6 +70,10 @@ struct platform_device;
 /* PKO output queues: the most a port can have */
 #define OPIP_MAX_TXQS		16
 
+/* Ethernet header, FCS and a VLAN tag on top of the MTU */
+#define OPIP_MTU_OVERHEAD	(ETH_HLEN + ETH_FCS_LEN + VLAN_HLEN)
+#define OPIP_MAX_FRAME		65392
+
 /* ------------------------------------------------------------------ */
 
 /* An interface: a GMX, NPI or LOOP block with up to 16 ports */
@@ -79,6 +83,20 @@ struct opip_iface {
 	int num_ports;
 	/* The IPD/PKO port of index 0 */
 	int first_port;
+	/* An SGMII interface running QSGMII (CN70XX) */
+	bool qsgmii;
+};
+
+/* A port, the private data of its net_device */
+struct opip_port {
+	struct opip *opip;
+	struct opip_iface *iface;
+	struct net_device *netdev;
+	/* IPD/PKO port number, and the index on the interface */
+	int port;
+	int index;
+	struct work_struct	rx_mode_work;
+	struct device_node	*of_node;
 };
 
 /* The packet I/O complex */
@@ -88,16 +106,28 @@ struct opip {
 	unsigned int num_packet_buffers;
 	int num_ifaces;
 	struct opip_iface ifaces[OPIP_MAX_IFACES];
+	/* The devices, by IPD port */
+	struct net_device *ports[OPIP_MAX_PORTS];
 	/* The POW groups in use */
 	unsigned int groups_mask;
 	/* PKO output queues per port of the GMX interfaces */
 	int queues_per_port;
+	/*
+	 * Serializes the register sequences of process context: link setup,
+	 * filters, statistics. Some wait, so it is a mutex.
+	 */
+	struct mutex hw_lock;
 	/* The hardware was released, by remove or by shutdown */
 	bool released;
 	/* What was put into the pools, to check what comes back */
 	unsigned int wqe_bufs;
 	unsigned int cmd_bufs;
 };
+
+static inline struct opip_port *opip_port(struct net_device *dev)
+{
+	return netdev_priv(dev);
+}
 
 /* The IPD/PKO port of a port on an interface */
 static inline int opip_port_number(int iface, int index)
@@ -123,5 +153,17 @@ static inline bool opip_iface_is_gmx(const struct opip_iface *iface)
 		return false;
 	}
 }
+
+/*
+ * The receive filters and frame limits are set up on interfaces 0 and 1:
+ * the further GMX blocks of CN68XX are not checked.
+ */
+static inline bool opip_port_has_gmx(const struct opip_port *p)
+{
+	return p->iface->num < 2 && opip_iface_is_gmx(p->iface);
+}
+
+/* octeon_pip_main.c */
+void opip_port_enable(struct opip_port *p, bool en);
 
 #endif /* OCTEON_PIP_H */

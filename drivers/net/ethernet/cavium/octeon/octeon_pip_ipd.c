@@ -235,3 +235,18 @@ void opip_pip_length_checks(int port, bool enable)
 			 OPIP_PIP_PRT_CFG_MINERR_EN);
 	opip_wr(OPIP_PIP_PRT_CFG(port), cfg);
 }
+
+/**
+ * opip_pip_frame_length - set the limits of a frame length checker
+ * @n:   Checker, 0 or 1
+ * @min: Shortest frame
+ * @max: Longest frame
+ *
+ * CN5XXX and later; which ports a checker serves, see opip_set_hw_mtu().
+ */
+void opip_pip_frame_length(int n, unsigned int min, unsigned int max)
+{
+	opip_wr(OPIP_PIP_FRM_LEN_CHK(n),
+		FIELD_PREP(OPIP_PIP_FRM_LEN_CHK_MINLEN, min) |
+		FIELD_PREP(OPIP_PIP_FRM_LEN_CHK_MAXLEN, max));
+}

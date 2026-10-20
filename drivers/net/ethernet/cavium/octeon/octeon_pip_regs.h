@@ -39,13 +39,44 @@ static inline u64 opip_iface_stride(void)
 
 #define OPIP_GMX_BASE		0x0001180008000000ull
 
+/* A register of one port of a GMX: 2048 bytes between the ports */
+static inline u64 opip_gmx_port_reg(int iface, int index, u64 off)
+{
+	return OPIP_CSR(OPIP_GMX_BASE + off + (u64)index * 2048 +
+			(u64)iface * opip_iface_stride());
+}
+
 /* A register of the GMX of an interface */
 static inline u64 opip_gmx_reg(int iface, u64 off)
 {
 	return OPIP_CSR(OPIP_GMX_BASE + off + (u64)iface * opip_iface_stride());
 }
 
+#define OPIP_GMX_PRT_CFG(i, p)		opip_gmx_port_reg(i, p, 0x010)
+#define OPIP_GMX_RX_FRM_MAX(i, p)	opip_gmx_port_reg(i, p, 0x030)
+#define OPIP_GMX_RX_JABBER(i, p)	opip_gmx_port_reg(i, p, 0x038)
+#define OPIP_GMX_RX_ADR_CTL(i, p)	opip_gmx_port_reg(i, p, 0x100)
+#define OPIP_GMX_RX_ADR_CAM_EN(i, p)	opip_gmx_port_reg(i, p, 0x108)
+#define OPIP_GMX_RX_ADR_CAM(i, p, n)	opip_gmx_port_reg(i, p, 0x180 + (n) * 8)
+#define OPIP_GMX_SMAC(i, p)		opip_gmx_port_reg(i, p, 0x230)
 #define OPIP_GMX_INF_MODE(i)		opip_gmx_reg(i, 0x7F8)
+
+/* GMX_PRTn_CFG */
+#define OPIP_GMX_PRT_CFG_PKND		GENMASK_ULL(21, 16)
+#define OPIP_GMX_PRT_CFG_TX_IDLE	BIT_ULL(13)
+#define OPIP_GMX_PRT_CFG_RX_IDLE	BIT_ULL(12)
+#define OPIP_GMX_PRT_CFG_SPEED_MSB	BIT_ULL(8)
+#define OPIP_GMX_PRT_CFG_SLOTTIME	BIT_ULL(3)
+#define OPIP_GMX_PRT_CFG_DUPLEX		BIT_ULL(2)
+#define OPIP_GMX_PRT_CFG_SPEED		BIT_ULL(1)
+#define OPIP_GMX_PRT_CFG_EN		BIT_ULL(0)
+
+/* GMX_RXn_ADR_CTL */
+#define OPIP_GMX_RX_ADR_CTL_CAM_MODE	BIT_ULL(3)
+#define OPIP_GMX_RX_ADR_CTL_MCST	GENMASK_ULL(2, 1)
+#define OPIP_GMX_RX_ADR_CTL_MCST_REJECT	1
+#define OPIP_GMX_RX_ADR_CTL_MCST_ACCEPT	2
+#define OPIP_GMX_RX_ADR_CTL_BCST	BIT_ULL(0)
 
 /* GMX_INF_MODE */
 #define OPIP_GMX_INF_MODE_MODE		GENMASK_ULL(6, 4)
@@ -62,10 +93,15 @@ static inline u64 opip_gmx_reg(int iface, u64 off)
 
 #define OPIP_PIP_REG(off)		OPIP_CSR(OPIP_PIP_BASE + (off))
 #define OPIP_PIP_SFT_RST		OPIP_PIP_REG(0x030)
+#define OPIP_PIP_FRM_LEN_CHK(n)		OPIP_PIP_REG(0x180 + (n) * 8)
 #define OPIP_PIP_PRT_CFG(p)		OPIP_PIP_REG(0x200 + (p) * 8)
 #define OPIP_PIP_PRT_TAG(p)		OPIP_PIP_REG(0x400 + (p) * 8)
 
 #define OPIP_PIP_SFT_RST_RST		BIT_ULL(0)
+
+/* PIP_FRM_LEN_CHKn */
+#define OPIP_PIP_FRM_LEN_CHK_MAXLEN	GENMASK_ULL(31, 16)
+#define OPIP_PIP_FRM_LEN_CHK_MINLEN	GENMASK_ULL(15, 0)
 
 /* PIP_PRT_CFGn */
 #define OPIP_PIP_PRT_CFG_LEN_CHK_SEL	BIT_ULL(53)
