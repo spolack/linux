@@ -5949,6 +5949,7 @@ M:	Simon Polack <spolack+git@mailbox.org>
 L:	netdev@vger.kernel.org
 S:	Maintained
 F:	Documentation/devicetree/bindings/net/cavium,octeon-3860-pip.yaml
+F:	Documentation/networking/device_drivers/ethernet/cavium/
 F:	drivers/net/ethernet/cavium/octeon/octeon_pip*
 
 CAVIUM OCTEON-TX CRYPTO DRIVER

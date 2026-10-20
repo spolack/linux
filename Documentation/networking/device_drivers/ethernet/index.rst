@@ -18,6 +18,7 @@ Contents:
    amd/pds_vdpa
    amd/pds_vfio_pci
    aquantia/atlantic
+   cavium/octeon_pip
    chelsio/cxgb
    dlink/dl2k
    davicom/dm9000
