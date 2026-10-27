@@ -148,15 +148,30 @@ int opip_sgmii_enable(int iface, int num_ports)
 	return 0;
 }
 
+/*
+ * Errata G-15618: no soft reset of the PCS on CN63XX, CN66XX pass 1 and
+ * CN68XX; the SDK only restarts the autonegotiation there
+ * (cvmx-helper-sgmii.c, __cvmx_helper_need_g15618(); its comment names
+ * CN63XX up to pass 2.1, its code, followed here, every CN63XX).
+ */
+static bool opip_pcs_no_reset(void)
+{
+	return OCTEON_IS_MODEL(OCTEON_CN63XX) ||
+	       OCTEON_IS_MODEL(OCTEON_CN66XX_PASS1_X) ||
+	       OCTEON_IS_MODEL(OCTEON_CN68XX);
+}
+
 /**
  * opip_pcs_reset - take a port's PCS through a reset and start a new AN
  * @iface: Interface
  * @index: Port on it
  *
- * Does not wait for the autonegotiation: it completes once the PHY's
- * in-band signalling is there, which opip_pcs_link() reports. Speed and
- * duplex bits a previous out-of-band link left in PCS_MR_CONTROL stay:
- * with AN_EN set the PCS takes both from the autonegotiation.
+ * No reset on the simulator and on the chips of errata G-15618, see
+ * opip_pcs_no_reset(): only the new autonegotiation. Does not wait for
+ * it: it completes once the PHY's in-band signalling is there, which
+ * opip_pcs_link() reports. Speed and duplex bits a previous out-of-band
+ * link left in PCS_MR_CONTROL stay: with AN_EN set the PCS takes both
+ * from the autonegotiation.
  *
  * Return: 0, or -ETIMEDOUT if the PCS does not come out of the reset
  */
@@ -164,7 +179,7 @@ static int opip_pcs_reset(int iface, int index)
 {
 	u64 ctl = opip_rd(OPIP_PCS_MR_CONTROL(iface, index));
 
-	if (!opip_on_simulator()) {
+	if (!opip_on_simulator() && !opip_pcs_no_reset()) {
 		opip_wr(OPIP_PCS_MR_CONTROL(iface, index),
 			ctl | OPIP_PCS_MR_CONTROL_RESET);
 		if (read_poll_timeout(opip_rd, ctl,
